@@ -12,6 +12,7 @@
 #include <cstring>
 #include <vector>
 #include <mutex>
+#include <condition_variable>
 
 FileSender::FileSender(ConnectionPool& pool,
                        TuiState& tui_state,
@@ -173,7 +174,7 @@ bool FileSender::send_large_file_parallel(
     // Calculate chunks
     u32 total_chunks = (u32)((fe.file_size + chunk_size_ - 1) / chunk_size_);
 
-    // Thread 0 sends FileMeta
+    // Thread 0 sends FileMeta FIRST, then signals other threads
     if (thread_idx == 0) {
         int meta_conn = conn_indices.empty() ? 0 : conn_indices[0];
 
@@ -199,9 +200,25 @@ bool FileSender::send_large_file_parallel(
         pool_.checkin(meta_conn);
 
         // Initialize per-file tracking
-        std::lock_guard<std::mutex> lk(file_completion_mutex_);
-        file_threads_pending_[fe.file_id] = num_threads_for_file;
-        file_success_[fe.file_id] = true;
+        {
+            std::lock_guard<std::mutex> lk(file_completion_mutex_);
+            file_threads_pending_[fe.file_id] = num_threads_for_file;
+            file_success_[fe.file_id] = true;
+        }
+
+        // Signal FileMeta sent - other threads can now send chunks
+        {
+            std::lock_guard<std::mutex> lk(file_meta_mutex_);
+            file_meta_ready_[fe.file_id] = true;
+        }
+        file_meta_cv_.notify_all();
+    } else {
+        // Other threads: wait for FileMeta to be sent first
+        std::unique_lock<std::mutex> lk(file_meta_mutex_);
+        file_meta_cv_.wait(lk, [this, &fe] {
+            auto it = file_meta_ready_.find(fe.file_id);
+            return it != file_meta_ready_.end() && it->second;
+        });
     }
 
     // Each thread handles chunks where (chunk_index % num_threads) == thread_idx
@@ -284,6 +301,7 @@ bool FileSender::send_large_file_parallel(
             file_threads_pending_.erase(fe.file_id);
             file_success_.erase(fe.file_id);
             file_chunks_pending_.erase(fe.file_id);
+            file_meta_ready_.erase(fe.file_id);
 
             // Callback
             if (on_done) {

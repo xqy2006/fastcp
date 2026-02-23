@@ -23,6 +23,7 @@
 #include <atomic>
 #include <thread>
 #include <functional>
+#include <condition_variable>
 
 // Delta checksums received from client
 using DeltaChecksumMap  = std::unordered_map<u32, std::vector<BlockChecksumEntry>>;
@@ -104,6 +105,11 @@ private:
     std::unordered_map<u32, std::atomic<int>> file_chunks_pending_;  // file_id -> remaining chunks
     std::unordered_map<u32, std::atomic<int>> file_threads_pending_; // file_id -> remaining threads
     std::unordered_map<u32, bool> file_success_;                     // file_id -> success status
+
+    // Synchronization: wait for FileMeta before sending chunks
+    std::mutex file_meta_mutex_;
+    std::condition_variable file_meta_cv_;
+    std::unordered_map<u32, bool> file_meta_ready_;
 
     bool send_chunk(TcpSocket& sock,
                     const FileEntry& fe,

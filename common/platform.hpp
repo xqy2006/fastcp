@@ -4,6 +4,9 @@
 // platform.hpp -- Cross-platform socket/OS abstraction
 // ============================================================
 
+#include <string>
+#include <cstdint>
+
 #ifdef _WIN32
 #  ifndef WIN32_LEAN_AND_MEAN
 #    define WIN32_LEAN_AND_MEAN
@@ -26,6 +29,15 @@
 
    inline int last_socket_error() { return WSAGetLastError(); }
    inline bool would_block(int err) { return err == WSAEWOULDBLOCK; }
+   inline std::string socket_error_str(int err) {
+       char buf[256] = {0};
+       FormatMessageA(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+                      nullptr, err, 0, buf, sizeof(buf), nullptr);
+       std::string s = buf;
+       // Remove trailing CR/LF
+       while (!s.empty() && (s.back() == '\r' || s.back() == '\n')) s.pop_back();
+       return s + " (err=" + std::to_string(err) + ")";
+   }
 
 #else // POSIX
 #  include <sys/types.h>
@@ -36,6 +48,7 @@
 #  include <unistd.h>
 #  include <fcntl.h>
 #  include <errno.h>
+#  include <cstring>
 #  include <netdb.h>
 
    using socket_t = int;
@@ -45,12 +58,13 @@
 
    inline int last_socket_error() { return errno; }
    inline bool would_block(int err) { return err == EAGAIN || err == EWOULDBLOCK; }
+   inline std::string socket_error_str(int err) {
+       return std::string(strerror(err)) + " (errno=" + std::to_string(err) + ")";
+   }
 #endif
 
-#include <cstdint>
 #include <cstddef>
 #include <stdexcept>
-#include <string>
 
 // ---- Platform init/cleanup ----
 

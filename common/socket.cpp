@@ -20,7 +20,7 @@ static constexpr int SOCKET_BUF_SIZE = 4 * 1024 * 1024;
 TcpSocket::TcpSocket() {
     fd_ = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (fd_ == INVALID_SOCKET_VAL) {
-        throw std::runtime_error("socket() failed: " + std::to_string(last_socket_error()));
+        throw std::runtime_error("socket() failed: " + socket_error_str(last_socket_error()));
     }
     apply_socket_opts();
 }
@@ -96,7 +96,7 @@ void TcpSocket::connect(const std::string& ip, u16 port) {
     }
 #endif
     if (::connect(fd_, (sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR_VAL) {
-        throw std::runtime_error("connect() failed: " + std::to_string(last_socket_error()));
+        throw std::runtime_error("connect() failed: " + socket_error_str(last_socket_error()));
     }
     tune();
 }
@@ -115,10 +115,10 @@ void TcpSocket::bind_and_listen(const std::string& ip, u16 port, int backlog) {
 #endif
     }
     if (::bind(fd_, (sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR_VAL) {
-        throw std::runtime_error("bind() failed: " + std::to_string(last_socket_error()));
+        throw std::runtime_error("bind() failed: " + socket_error_str(last_socket_error()));
     }
     if (::listen(fd_, backlog) == SOCKET_ERROR_VAL) {
-        throw std::runtime_error("listen() failed: " + std::to_string(last_socket_error()));
+        throw std::runtime_error("listen() failed: " + socket_error_str(last_socket_error()));
     }
 }
 
@@ -131,7 +131,7 @@ TcpSocket TcpSocket::accept() {
 #endif
     socket_t client = ::accept(fd_, (sockaddr*)&peer, &peer_len);
     if (client == INVALID_SOCKET_VAL) {
-        throw std::runtime_error("accept() failed: " + std::to_string(last_socket_error()));
+        throw std::runtime_error("accept() failed: " + socket_error_str(last_socket_error()));
     }
     return TcpSocket(client);
 }
@@ -154,7 +154,7 @@ void TcpSocket::send_all(const void* buf, size_t len) {
                 // busy-wait (shouldn't happen in blocking mode)
                 continue;
             }
-            throw std::runtime_error("send() failed: " + std::to_string(err));
+            throw std::runtime_error("send() failed: " + socket_error_str(err));
         }
         p += sent;
         remaining -= static_cast<size_t>(sent);
@@ -177,7 +177,7 @@ bool TcpSocket::recv_all(void* buf, size_t len) {
                 // Timeout (SO_RCVTIMEO) - return false instead of busy-wait
                 return false;
             }
-            throw std::runtime_error("recv() failed: " + std::to_string(err));
+            throw std::runtime_error("recv() failed: " + socket_error_str(err));
         }
         p += received;
         remaining -= static_cast<size_t>(received);
@@ -211,7 +211,7 @@ void TcpSocket::write_frame(MsgType type, u16 flags, const void* payload, u32 pa
         if (remaining1 > 0) { wb[cnt].buf = const_cast<char*>(p1); wb[cnt].len = (ULONG)std::min(remaining1, (size_t)INT_MAX); ++cnt; }
         DWORD sent = 0;
         int rc = WSASend(fd_, wb, cnt, &sent, 0, nullptr, nullptr);
-        if (rc == SOCKET_ERROR) throw std::runtime_error("WSASend failed: " + std::to_string(WSAGetLastError()));
+        if (rc == SOCKET_ERROR) throw std::runtime_error("WSASend failed: " + socket_error_str(WSAGetLastError()));
         size_t n = sent;
         if (!hdr_done) {
             size_t take = std::min(n, remaining0);
@@ -247,7 +247,7 @@ void TcpSocket::write_frame(MsgType type, u16 flags, const void* payload, u32 pa
         ssize_t n = ::writev(fd_, cur, cur_cnt);
         if (n < 0) {
             if (errno == EINTR) continue;
-            throw std::runtime_error("writev failed: " + std::to_string(errno));
+            throw std::runtime_error("writev failed: " + socket_error_str(errno));
         }
         sent_total += n;
     }
