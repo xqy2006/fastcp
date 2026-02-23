@@ -641,33 +641,32 @@ bool ClientSession::phase_transfer(const SyncPlanMap& plan) {
 
     // ---- Send large files in parallel ----
     // Smart scheduling:
-    //   - If N conns <= M files: send min(N, M) files concurrently, each with 1 connection
-    //   - If N conns > M files: distribute extra connections to files for intra-file parallelism
+    //   - Each file can use multiple connections for intra-file parallelism
+    //   - When there are more files than connections, interleave them
 
     if (!large_files.empty()) {
         int num_files = (int)large_files.size();
 
-        // Calculate how many files to send in parallel (at most one per connection)
-        int batch_size = std::min(num_conns, num_files);
+        // Decide: how many files to send in parallel?
+        // If more conns than files, each file gets multiple conns (intra-file parallelism)
+        // If more files than conns, send multiple files in parallel (inter-file parallelism)
 
-        // Assign connections to files in this batch
-        // Distribute: first 'remainder' files get (quotient + 1) conns, rest get quotient
-        int quotient = num_conns / batch_size;
-        int remainder = num_conns % batch_size;
-
-        std::vector<std::vector<int>> batch_conns(batch_size);
-        int conn_idx = 0;
-        for (int b = 0; b < batch_size; ++b) {
-            int count = quotient + (b < remainder ? 1 : 0);
-            for (int c = 0; c < count; ++c) {
-                batch_conns[b].push_back(conn_idx++);
-            }
-        }
+        int conns_per_file = std::max(1, num_conns / std::min(num_files, num_conns));
+        int files_in_parallel = std::min(num_files, num_conns);
 
         // Process files in batches
         int files_sent = 0;
         while (files_sent < num_files) {
-            int current_batch = std::min(batch_size, num_files - files_sent);
+            int current_batch = std::min(files_in_parallel, num_files - files_sent);
+
+            // Assign connections to files in this batch
+            std::vector<std::vector<int>> file_conns(current_batch);
+            int conn_idx = 0;
+            for (int b = 0; b < current_batch; ++b) {
+                for (int c = 0; c < conns_per_file && conn_idx < num_conns; ++c) {
+                    file_conns[b].push_back(conn_idx++);
+                }
+            }
 
             // Launch parallel transfers for this batch
             std::vector<std::thread> threads;
@@ -679,7 +678,7 @@ bool ClientSession::phase_transfer(const SyncPlanMap& plan) {
             for (int b = 0; b < current_batch; ++b) {
                 int fi = files_sent + b;
                 auto& [fe, resume_offset] = large_files[fi];
-                auto& conns = batch_conns[b];
+                auto& conns = file_conns[b];
                 int num_threads = (int)conns.size();
 
                 // Each file gets its own set of threads (intra-file parallelism)

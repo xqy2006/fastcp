@@ -28,7 +28,7 @@ public:
     // Get number of connections
     int size() const { return (int)sockets_.size(); }
 
-    // Get the i-th connection (0-indexed)
+    // Get the i-th connection (0-indexed) - UNSAFE, use only when single-threaded
     TcpSocket& get(int index) {
         return *sockets_.at((size_t)index);
     }
@@ -41,6 +41,33 @@ public:
     // Checkout connection by index (acquire lock on that slot)
     TcpSocket& checkout(int index);
     void checkin(int index);
+
+    // RAII guard for checked-out connection
+    class Guard {
+    public:
+        Guard(ConnectionPool& pool, int index) : pool_(pool), index_(index) {
+            sock_ = &pool_.checkout(index_);
+        }
+        ~Guard() { if (index_ >= 0) pool_.checkin(index_); }
+
+        Guard(Guard&& other) noexcept
+            : pool_(other.pool_), index_(other.index_), sock_(other.sock_) {
+            other.index_ = -1;
+        }
+        Guard(const Guard&) = delete;
+        Guard& operator=(const Guard&) = delete;
+
+        TcpSocket& socket() { return *sock_; }
+        TcpSocket* operator->() { return sock_; }
+
+    private:
+        ConnectionPool& pool_;
+        int index_;
+        TcpSocket* sock_;
+    };
+
+    // Convenience: get a RAII guard
+    Guard guard(int index) { return Guard(*this, index); }
 
     ConnectionPool(const ConnectionPool&) = delete;
     ConnectionPool& operator=(const ConnectionPool&) = delete;

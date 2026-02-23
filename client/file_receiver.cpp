@@ -12,6 +12,16 @@
 namespace fs = std::filesystem;
 
 bool FileReceiver::on_file_meta(const FileMeta& meta, const std::string& rel_path) {
+    // Use a single lock for the entire check-and-create operation
+    std::lock_guard<std::mutex> lk(states_mutex_);
+
+    // Check if we already have state for this file_id (multi-connection parallel transfer)
+    auto it = states_.find(meta.file_id);
+    if (it != states_.end()) {
+        // Already received FileMeta for this file, ignore duplicate
+        return true;
+    }
+
     try {
         fs::path abs = file_io::proto_to_fspath(session_->root_dir, rel_path);
         file_io::ensure_parent_dirs(abs.string());
@@ -34,17 +44,14 @@ bool FileReceiver::on_file_meta(const FileMeta& meta, const std::string& rel_pat
         u64 already_received = session_->transfer_index->get_received(meta.file_id);
         bool resume = (already_received > 0 && already_received < meta.file_size);
         if (!resume) {
-            std::lock_guard<std::mutex> lk(session_->delta_sent_mutex);
+            std::lock_guard<std::mutex> lk2(session_->delta_sent_mutex);
             if (session_->delta_sent.count(meta.file_id)) {
                 resume = true; // preserve existing data; server will overwrite changed blocks
             }
         }
         state->writer.open(abs.string(), meta.file_size, resume);
 
-        {
-            std::lock_guard<std::mutex> lk(states_mutex_);
-            states_[meta.file_id] = std::move(state);
-        }
+        states_[meta.file_id] = std::move(state);
 
         LOG_INFO("Receiving file: " + rel_path + " (" +
                  utils::format_bytes(meta.file_size) + ")");

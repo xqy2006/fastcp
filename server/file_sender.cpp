@@ -78,13 +78,11 @@ bool FileSender::send_large_file(const FileEntry& fe, u64 resume_offset, int con
         std::memcpy(payload.data() + sizeof(FileMeta),
                     fe.rel_path.data(), fe.rel_path.size());
 
-        TcpSocket& sock = pool_.checkout(meta_conn);
-        sock.write_frame(MsgType::MT_FILE_META, 0, payload.data(), (u32)payload.size());
-        pool_.checkin(meta_conn);
+        auto g = pool_.guard(meta_conn);
+        g.socket().write_frame(MsgType::MT_FILE_META, 0, payload.data(), (u32)payload.size());
     }
 
-    // Send chunks round-robin across all connections
-    int num_conns = pool_.size();
+    // Send chunks on the same connection as FileMeta (to maintain order)
     u64 delta_bytes_skipped = 0;
     for (u32 ci = start_chunk; ci < total_chunks; ++ci) {
         u64 offset = (u64)ci * chunk_size_;
@@ -100,14 +98,17 @@ bool FileSender::send_large_file(const FileEntry& fe, u64 resume_offset, int con
             continue;
         }
 
-        int target_conn = ci % (u32)num_conns;
+        // Use the assigned connection (meta_conn) for all chunks
+        auto g = pool_.guard(meta_conn);
+        bool ok = send_chunk(g.socket(), fe, ci, offset, data_ptr, raw_len, do_compress);
+        g.~Guard();  // Release lock before retry
 
-        bool ok = send_chunk(pool_.get(target_conn), fe, ci, offset, data_ptr, raw_len, do_compress);
         if (!ok) {
             bool success = false;
             for (int retry = 0; retry < 3 && !success; ++retry) {
                 LOG_WARN("Retrying chunk " + std::to_string(ci) + " of " + fe.rel_path);
-                success = send_chunk(pool_.get(target_conn), fe, ci, offset, data_ptr, raw_len, do_compress);
+                auto g2 = pool_.guard(meta_conn);
+                success = send_chunk(g2.socket(), fe, ci, offset, data_ptr, raw_len, do_compress);
             }
             if (!success) {
                 Logger::get().transfer_error("Chunk " + std::to_string(ci) +
@@ -134,9 +135,8 @@ bool FileSender::send_large_file(const FileEntry& fe, u64 resume_offset, int con
         FileEnd encoded = end_msg;
         proto::encode_file_end(encoded);
 
-        TcpSocket& sock = pool_.checkout(meta_conn);
-        sock.write_frame(MsgType::MT_FILE_END, 0, &encoded, sizeof(encoded));
-        pool_.checkin(meta_conn);
+        auto g = pool_.guard(meta_conn);
+        g.socket().write_frame(MsgType::MT_FILE_END, 0, &encoded, sizeof(encoded));
     }
 
     return true;
@@ -152,6 +152,13 @@ bool FileSender::send_large_file_parallel(
     int thread_idx,
     FileDoneCallback on_done)
 {
+    // Each thread uses its own dedicated connection for data ordering
+    if (thread_idx >= (int)conn_indices.size()) {
+        LOG_ERROR("thread_idx out of range: " + std::to_string(thread_idx));
+        return false;
+    }
+    int my_conn = conn_indices[thread_idx];
+
     // Update TUI current file (only first thread)
     if (thread_idx == 0) {
         std::lock_guard<std::mutex> lk(tui_state_.current_file_mutex);
@@ -174,10 +181,19 @@ bool FileSender::send_large_file_parallel(
     // Calculate chunks
     u32 total_chunks = (u32)((fe.file_size + chunk_size_ - 1) / chunk_size_);
 
-    // Thread 0 sends FileMeta FIRST, then signals other threads
+    // Initialize per-file tracking (only thread 0, before any other work)
     if (thread_idx == 0) {
-        int meta_conn = conn_indices.empty() ? 0 : conn_indices[0];
+        std::lock_guard<std::mutex> lk(file_completion_mutex_);
+        file_threads_pending_[fe.file_id] = num_threads_for_file;
+        file_success_[fe.file_id] = true;
+    }
 
+    // Small delay to ensure thread 0's initialization is visible
+    // (This is a simple barrier; could use std::barrier in C++20)
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+
+    // Each thread sends FileMeta on its own connection (client ignores duplicates)
+    {
         FileMeta meta{};
         meta.file_id     = fe.file_id;
         meta.file_size   = fe.file_size;
@@ -195,34 +211,12 @@ bool FileSender::send_large_file_parallel(
         std::memcpy(payload.data() + sizeof(FileMeta),
                     fe.rel_path.data(), fe.rel_path.size());
 
-        TcpSocket& sock = pool_.checkout(meta_conn);
-        sock.write_frame(MsgType::MT_FILE_META, 0, payload.data(), (u32)payload.size());
-        pool_.checkin(meta_conn);
-
-        // Initialize per-file tracking
-        {
-            std::lock_guard<std::mutex> lk(file_completion_mutex_);
-            file_threads_pending_[fe.file_id] = num_threads_for_file;
-            file_success_[fe.file_id] = true;
-        }
-
-        // Signal FileMeta sent - other threads can now send chunks
-        {
-            std::lock_guard<std::mutex> lk(file_meta_mutex_);
-            file_meta_ready_[fe.file_id] = true;
-        }
-        file_meta_cv_.notify_all();
-    } else {
-        // Other threads: wait for FileMeta to be sent first
-        std::unique_lock<std::mutex> lk(file_meta_mutex_);
-        file_meta_cv_.wait(lk, [this, &fe] {
-            auto it = file_meta_ready_.find(fe.file_id);
-            return it != file_meta_ready_.end() && it->second;
-        });
+        auto g = pool_.guard(my_conn);
+        g.socket().write_frame(MsgType::MT_FILE_META, 0, payload.data(), (u32)payload.size());
     }
 
     // Each thread handles chunks where (chunk_index % num_threads) == thread_idx
-    // Distribute across assigned connections (with proper locking!)
+    // Send on this thread's dedicated connection
     u64 delta_bytes_skipped = 0;
     bool thread_ok = true;
 
@@ -240,21 +234,16 @@ bool FileSender::send_large_file_parallel(
             continue;
         }
 
-        // Select connection for this chunk: round-robin within assigned connections
-        int conn_offset = (ci / (u32)num_threads_for_file) % (int)conn_indices.size();
-        int target_conn = conn_indices[conn_offset];
-
-        // IMPORTANT: Use checkout/checkin for thread-safe socket access
-        TcpSocket& sock = pool_.checkout(target_conn);
-        bool ok = send_chunk(sock, fe, ci, offset, data_ptr, raw_len, do_compress);
-        pool_.checkin(target_conn);
+        // Send chunk on this thread's dedicated connection
+        auto g = pool_.guard(my_conn);
+        bool ok = send_chunk(g.socket(), fe, ci, offset, data_ptr, raw_len, do_compress);
+        g.~Guard();
 
         if (!ok) {
             bool success = false;
             for (int retry = 0; retry < 3 && !success; ++retry) {
-                TcpSocket& sock2 = pool_.checkout(target_conn);
-                success = send_chunk(sock2, fe, ci, offset, data_ptr, raw_len, do_compress);
-                pool_.checkin(target_conn);
+                auto g2 = pool_.guard(my_conn);
+                success = send_chunk(g2.socket(), fe, ci, offset, data_ptr, raw_len, do_compress);
             }
             if (!success) {
                 Logger::get().transfer_error("Chunk " + std::to_string(ci) +
@@ -271,8 +260,8 @@ bool FileSender::send_large_file_parallel(
                   utils::format_bytes(delta_bytes_skipped) + " of " + fe.rel_path);
     }
 
-    // Thread 0 sends FILE_END and calls callback
-    // But we need to coordinate: wait for all threads to finish their chunks
+    // Coordinate: wait for all threads to finish their chunks
+    // Last thread sends FILE_END
     {
         std::lock_guard<std::mutex> lk(file_completion_mutex_);
         if (!thread_ok) {
@@ -281,9 +270,8 @@ bool FileSender::send_large_file_parallel(
         int remaining = --file_threads_pending_[fe.file_id];
 
         if (remaining == 0) {
-            // Last thread: send FILE_END
-            int meta_conn = conn_indices.empty() ? 0 : conn_indices[0];
-            bool success = file_success_[fe.file_id];
+            // Last thread: send FILE_END on connection 0
+            int end_conn = conn_indices[0];
 
             FileEnd end_msg{};
             end_msg.file_id    = fe.file_id;
@@ -293,15 +281,15 @@ bool FileSender::send_large_file_parallel(
             FileEnd encoded = end_msg;
             proto::encode_file_end(encoded);
 
-            TcpSocket& sock = pool_.checkout(meta_conn);
-            sock.write_frame(MsgType::MT_FILE_END, 0, &encoded, sizeof(encoded));
-            pool_.checkin(meta_conn);
+            {
+                auto g = pool_.guard(end_conn);
+                g.socket().write_frame(MsgType::MT_FILE_END, 0, &encoded, sizeof(encoded));
+            }
 
             // Cleanup
             file_threads_pending_.erase(fe.file_id);
             file_success_.erase(fe.file_id);
             file_chunks_pending_.erase(fe.file_id);
-            file_meta_ready_.erase(fe.file_id);
 
             // Callback
             if (on_done) {
@@ -318,11 +306,20 @@ bool FileSender::send_large_file_parallel(
 bool FileSender::send_bundle(const std::vector<const FileEntry*>& files, int conn_idx) {
     if (files.empty()) return true;
 
-    TcpSocket& sock = pool_.checkout(conn_idx);
+    auto g = pool_.guard(conn_idx);
+    TcpSocket& sock = g.socket();
 
-    // Send BUNDLE_BEGIN with file count
-    u32 count = (u32)files.size();
-    sock.write_frame(MsgType::MT_BUNDLE_BEGIN, 0, &count, sizeof(count));
+    // Send BUNDLE_BEGIN with file count and total size
+    u64 total_size = 0;
+    for (auto* fe : files) total_size += fe->file_size;
+
+    BundleBegin bb{};
+    bb.bundle_id   = 0;
+    bb.file_count  = (u16)files.size();
+    bb.pad[0] = bb.pad[1] = 0;
+    bb.total_size  = total_size;
+    proto::encode_bundle_begin(bb);
+    sock.write_frame(MsgType::MT_BUNDLE_BEGIN, 0, &bb, sizeof(bb));
 
     bool all_ok = true;
     for (auto* fe : files) {
@@ -362,7 +359,6 @@ bool FileSender::send_bundle(const std::vector<const FileEntry*>& files, int con
     // Send BUNDLE_END
     sock.write_frame(MsgType::MT_BUNDLE_END, 0, nullptr, 0);
 
-    pool_.checkin(conn_idx);
     return all_ok;
 }
 
