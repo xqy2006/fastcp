@@ -588,24 +588,10 @@ bool ClientSession::phase_transfer(const SyncPlanMap& plan) {
     FileSender sender(pool_, tui_state_, cfg_.use_compress, agreed_chunk_size_,
                       delta_checksums_, delta_block_sizes_);
 
-    std::vector<const FileEntry*> bundle_queue;
-    u64 bundle_size = 0;
-    u32 bundle_conn = 0;
-    bool all_ok     = true;
+    // Separate small files (bundles) and large files (parallel)
+    std::vector<const FileEntry*> small_files;
+    std::vector<std::pair<const FileEntry*, u64>> large_files; // (entry, resume_offset)
 
-    auto flush_bundle = [&]() {
-        if (!bundle_queue.empty()) {
-            if (!sender.send_bundle(bundle_queue, (int)bundle_conn)) {
-                all_ok = false;
-            }
-            tui_state_.files_done.fetch_add((u32)bundle_queue.size());
-            bundle_conn = (bundle_conn + 1) % (u32)pool_.size();
-            bundle_queue.clear();
-            bundle_size = 0;
-        }
-    };
-
-    int large_conn_idx = 0;
     for (auto& fe : entries_) {
         auto it = plan.plan.find(fe.file_id);
         if (it != plan.plan.end() && it->second.first == SyncAction::SKIP) {
@@ -617,21 +603,127 @@ bool ClientSession::phase_transfer(const SyncPlanMap& plan) {
         }
 
         if (fe.is_small) {
-            bundle_queue.push_back(&fe);
-            bundle_size += fe.file_size;
-            if (bundle_queue.size() >= MAX_BUNDLE_FILES ||
-                bundle_size >= MAX_BUNDLE_SIZE)
-            {
-                flush_bundle();
-            }
+            small_files.push_back(&fe);
         } else {
-            int conn = large_conn_idx++ % pool_.size();
-            bool ok = sender.send_large_file(fe, resume_offset, conn);
-            if (ok) tui_state_.files_done.fetch_add(1);
-            else    all_ok = false;
+            large_files.emplace_back(&fe, resume_offset);
         }
     }
-    flush_bundle();
+
+    int num_conns = pool_.size();
+    bool all_ok = true;
+
+    // ---- Send small files as bundles (round-robin on connections) ----
+    {
+        std::vector<const FileEntry*> bundle;
+        u64 bundle_size = 0;
+        u32 bundle_conn = 0;
+
+        auto flush_bundle = [&]() {
+            if (bundle.empty()) return;
+            if (!sender.send_bundle(bundle, (int)bundle_conn)) {
+                all_ok = false;
+            }
+            tui_state_.files_done.fetch_add((u32)bundle.size());
+            bundle_conn = (bundle_conn + 1) % (u32)num_conns;
+            bundle.clear();
+            bundle_size = 0;
+        };
+
+        for (auto* fe : small_files) {
+            bundle.push_back(fe);
+            bundle_size += fe->file_size;
+            if (bundle.size() >= MAX_BUNDLE_FILES || bundle_size >= MAX_BUNDLE_SIZE) {
+                flush_bundle();
+            }
+        }
+        flush_bundle();
+    }
+
+    // ---- Send large files in parallel ----
+    // Smart scheduling:
+    //   - If N conns <= M files: send min(N, M) files concurrently, each with 1 connection
+    //   - If N conns > M files: distribute extra connections to files for intra-file parallelism
+
+    if (!large_files.empty()) {
+        int num_files = (int)large_files.size();
+
+        // Calculate how many files to send in parallel (at most one per connection)
+        int batch_size = std::min(num_conns, num_files);
+
+        // Assign connections to files in this batch
+        // Distribute: first 'remainder' files get (quotient + 1) conns, rest get quotient
+        int quotient = num_conns / batch_size;
+        int remainder = num_conns % batch_size;
+
+        std::vector<std::vector<int>> batch_conns(batch_size);
+        int conn_idx = 0;
+        for (int b = 0; b < batch_size; ++b) {
+            int count = quotient + (b < remainder ? 1 : 0);
+            for (int c = 0; c < count; ++c) {
+                batch_conns[b].push_back(conn_idx++);
+            }
+        }
+
+        // Process files in batches
+        int files_sent = 0;
+        while (files_sent < num_files) {
+            int current_batch = std::min(batch_size, num_files - files_sent);
+
+            // Launch parallel transfers for this batch
+            std::vector<std::thread> threads;
+            std::atomic<int> batch_files_done{0};
+            std::atomic<int> batch_files_ok{0};
+            std::mutex result_mutex;
+            bool batch_all_ok = true;
+
+            for (int b = 0; b < current_batch; ++b) {
+                int fi = files_sent + b;
+                auto& [fe, resume_offset] = large_files[fi];
+                auto& conns = batch_conns[b];
+                int num_threads = (int)conns.size();
+
+                // Each file gets its own set of threads (intra-file parallelism)
+                for (int ti = 0; ti < num_threads; ++ti) {
+                    threads.emplace_back([&, fe, resume_offset, conns, ti, num_threads]() {
+                        try {
+                            bool ok = sender.send_large_file_parallel(
+                                *fe,
+                                resume_offset,
+                                conns,
+                                num_threads,
+                                ti,
+                                [&](u32 /*file_id*/) {
+                                    // Called when file complete (last thread only)
+                                    tui_state_.files_done.fetch_add(1);
+                                    batch_files_ok.fetch_add(1);
+                                }
+                            );
+                            if (!ok) {
+                                std::lock_guard<std::mutex> lk(result_mutex);
+                                batch_all_ok = false;
+                            }
+                        } catch (const std::exception& e) {
+                            LOG_ERROR("Parallel send error: " + std::string(e.what()));
+                            std::lock_guard<std::mutex> lk(result_mutex);
+                            batch_all_ok = false;
+                        }
+                    });
+                }
+            }
+
+            // Wait for this batch
+            for (auto& t : threads) {
+                if (t.joinable()) t.join();
+            }
+
+            if (!batch_all_ok) {
+                all_ok = false;
+            }
+
+            files_sent += current_batch;
+        }
+    }
+
     return all_ok;
 }
 
