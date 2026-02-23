@@ -1,0 +1,186 @@
+name: Build & Release
+
+# Trigger on version tags (e.g. v1.0.0) or manual dispatch
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v1.0.0)'
+        required: true
+        default: 'v0.0.0-test'
+
+jobs:
+  # ──────────────────────────────────────────────
+  # Windows build (MSVC x64)
+  # ──────────────────────────────────────────────
+  build-windows:
+    name: Windows (MSVC x64)
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Clone third-party dependencies
+        shell: bash
+        run: |
+          git clone --depth=1 --branch v0.8.2 https://github.com/Cyan4973/xxHash.git third_party/xxhash
+          git clone --depth=1 --branch v1.5.5 https://github.com/facebook/zstd.git   third_party/zstd
+
+      - name: Configure (Release, x64)
+        shell: cmd
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -A x64
+
+      - name: Build
+        shell: cmd
+        run: cmake --build build --config Release -j
+
+      - name: Collect artifacts
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp build/bin/Release/fastcp_server.exe dist/fastcp_server-windows-x64.exe
+          cp build/bin/Release/fastcp_client.exe dist/fastcp_client-windows-x64.exe
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64
+          path: dist/
+
+  # ──────────────────────────────────────────────
+  # Linux build (GCC, Ubuntu 22.04)
+  # ──────────────────────────────────────────────
+  build-linux:
+    name: Linux (GCC, Ubuntu 22.04)
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake build-essential git
+
+      - name: Clone third-party dependencies
+        run: |
+          git clone --depth=1 --branch v0.8.2 https://github.com/Cyan4973/xxHash.git third_party/xxhash
+          git clone --depth=1 --branch v1.5.5 https://github.com/facebook/zstd.git   third_party/zstd
+
+      - name: Configure (Release)
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build -j$(nproc)
+
+      - name: Strip binaries
+        run: |
+          strip build/bin/fastcp_server
+          strip build/bin/fastcp_client
+
+      - name: Collect artifacts
+        run: |
+          mkdir -p dist
+          cp build/bin/fastcp_server dist/fastcp_server-linux-x86_64
+          cp build/bin/fastcp_client dist/fastcp_client-linux-x86_64
+          chmod +x dist/*
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-x86_64
+          path: dist/
+
+  # ──────────────────────────────────────────────
+  # Create GitHub Release and attach all binaries
+  # ──────────────────────────────────────────────
+  release:
+    name: Publish Release
+    needs: [build-windows, build-linux]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # required to create releases and upload assets
+
+    steps:
+      - name: Checkout (for tag context)
+        uses: actions/checkout@v4
+
+      - name: Download Windows artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-x64
+          path: dist/
+
+      - name: Download Linux artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-x86_64
+          path: dist/
+
+      - name: Determine tag name
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "name=${{ github.event.inputs.tag }}" >> $GITHUB_OUTPUT
+          else
+            echo "name=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Generate SHA-256 checksums
+        run: |
+          cd dist
+          sha256sum \
+            fastcp_server-windows-x64.exe \
+            fastcp_client-windows-x64.exe \
+            fastcp_server-linux-x86_64    \
+            fastcp_client-linux-x86_64    \
+            > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.name }}
+          name: fastcp ${{ steps.tag.outputs.name }}
+          body: |
+            ## fastcp ${{ steps.tag.outputs.name }}
+
+            High-speed multi-connection file transfer tool (C++17, mmap, zstd, xxHash, delta-sync).
+
+            ### Quick start
+            ```bash
+            # 1. Start the server first (listens indefinitely, serves multiple clients)
+            fastcp_server <src_dir> <ip> <port>
+
+            # 2. Start the client (connects to server; retries if server not ready yet)
+            fastcp_client <dst_dir> <ip> <port>
+
+            # Optional flags for the server
+            fastcp_server <src_dir> <ip> <port> --conns 8 --no-compress --chunk-kb 2048
+
+            # Optional flags for the client
+            fastcp_client <dst_dir> <ip> <port> --retry 60
+            ```
+
+            ### Downloads
+
+            | Platform | Sender | Receiver |
+            |----------|--------|----------|
+            | **Windows x64** | `fastcp_server-windows-x64.exe` | `fastcp_client-windows-x64.exe` |
+            | **Linux x86_64** | `fastcp_server-linux-x86_64` | `fastcp_client-linux-x86_64` |
+
+            ### Verify integrity
+            ```bash
+            sha256sum -c SHA256SUMS.txt
+            ```
+          files: |
+            dist/fastcp_server-windows-x64.exe
+            dist/fastcp_client-windows-x64.exe
+            dist/fastcp_server-linux-x86_64
+            dist/fastcp_client-linux-x86_64
+            dist/SHA256SUMS.txt
+          draft: false
+          prerelease: ${{ contains(steps.tag.outputs.name, '-') }}
