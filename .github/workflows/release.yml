@@ -38,6 +38,36 @@ jobs:
         shell: cmd
         run: cmake --build build --config Release -j
 
+      - name: Functional test (Windows)
+        shell: bash
+        run: |
+          # Prepare test data
+          mkdir -p /tmp/fastcp_src/subdir
+          echo "hello fastcp" > /tmp/fastcp_src/a.txt
+          python3 -c "import os; open('/tmp/fastcp_src/b.bin','wb').write(os.urandom(65536))"
+          python3 -c "import os; open('/tmp/fastcp_src/subdir/c.bin','wb').write(os.urandom(524288))"
+          mkdir -p /tmp/fastcp_dst
+
+          # Start server in background
+          build/bin/Release/fastcp_server.exe /tmp/fastcp_src 127.0.0.1 19999 &
+          SERVER_PID=$!
+
+          # Run client (--retry 30: wait up to 30s for server to be ready)
+          build/bin/Release/fastcp_client.exe /tmp/fastcp_dst 127.0.0.1 19999 --retry 30
+          CLIENT_EXIT=$?
+
+          kill $SERVER_PID 2>/dev/null || true
+
+          if [ $CLIENT_EXIT -ne 0 ]; then
+            echo "FAIL: client exited with $CLIENT_EXIT"
+            exit 1
+          fi
+
+          diff /tmp/fastcp_src/a.txt /tmp/fastcp_dst/a.txt
+          diff /tmp/fastcp_src/b.bin /tmp/fastcp_dst/b.bin
+          diff /tmp/fastcp_src/subdir/c.bin /tmp/fastcp_dst/subdir/c.bin
+          echo "Windows functional test PASSED"
+
       - name: Collect artifacts
         shell: bash
         run: |
@@ -80,6 +110,61 @@ jobs:
         run: |
           strip build/bin/fastcp_server
           strip build/bin/fastcp_client
+
+      - name: Functional test (Linux)
+        run: |
+          # Prepare test data
+          mkdir -p /tmp/fastcp_src/subdir
+          echo "hello fastcp" > /tmp/fastcp_src/a.txt
+          python3 -c "import os; open('/tmp/fastcp_src/b.bin','wb').write(os.urandom(65536))"
+          python3 -c "import os; open('/tmp/fastcp_src/subdir/c.bin','wb').write(os.urandom(524288))"
+          python3 -c "import os; open('/tmp/fastcp_src/d.bin','wb').write(os.urandom(5*1024*1024))"
+          mkdir -p /tmp/fastcp_dst
+
+          # Start server in background
+          build/bin/fastcp_server /tmp/fastcp_src 127.0.0.1 19999 &
+          SERVER_PID=$!
+
+          # Run client (--retry 30: wait up to 30s for server to be ready)
+          build/bin/fastcp_client /tmp/fastcp_dst 127.0.0.1 19999 --retry 30
+          CLIENT_EXIT=$?
+
+          kill $SERVER_PID 2>/dev/null || true
+          wait $SERVER_PID 2>/dev/null || true
+
+          if [ $CLIENT_EXIT -ne 0 ]; then
+            echo "FAIL: client exited with $CLIENT_EXIT"
+            exit 1
+          fi
+
+          diff /tmp/fastcp_src/a.txt       /tmp/fastcp_dst/a.txt
+          diff /tmp/fastcp_src/b.bin       /tmp/fastcp_dst/b.bin
+          diff /tmp/fastcp_src/subdir/c.bin /tmp/fastcp_dst/subdir/c.bin
+          diff /tmp/fastcp_src/d.bin       /tmp/fastcp_dst/d.bin
+          echo "Linux functional test PASSED"
+
+      - name: Inspect binary (instruction set diagnostic)
+        run: |
+          echo "=== Dynamic library dependencies ==="
+          ldd build/bin/fastcp_server
+          echo ""
+          echo "=== CI runner CPU model ==="
+          grep "model name" /proc/cpuinfo | head -1
+          echo ""
+          echo "=== CI runner CPU flags (instruction sets) ==="
+          grep "^flags" /proc/cpuinfo | head -1
+          echo ""
+          echo "=== AVX2 instructions in server binary (ymm registers) ==="
+          YMM_COUNT=$(objdump -d build/bin/fastcp_server | grep -c "ymm" 2>/dev/null || echo 0)
+          echo "ymm (AVX2) instruction count: $YMM_COUNT"
+          echo ""
+          echo "=== AVX-512 instructions in server binary (zmm registers) ==="
+          ZMM_COUNT=$(objdump -d build/bin/fastcp_server | grep -c "zmm" 2>/dev/null || echo 0)
+          echo "zmm (AVX-512) instruction count: $ZMM_COUNT"
+          echo ""
+          echo "=== SSE4.2 instructions ==="
+          SSE42_COUNT=$(objdump -d build/bin/fastcp_server | grep -cE "\b(crc32|pcmpistri|pcmpistrm|pcmpestri|pcmpestrm)\b" 2>/dev/null || echo 0)
+          echo "SSE4.2 instruction count: $SSE42_COUNT"
 
       - name: Collect artifacts
         run: |
