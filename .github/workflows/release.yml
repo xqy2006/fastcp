@@ -33,34 +33,43 @@ jobs:
         run: cmake --build build --config Release -j
 
       - name: Functional test (Windows)
-        shell: bash
+        shell: pwsh
         run: |
-          # Prepare test data
-          mkdir -p /tmp/fastcp_src/subdir
-          echo "hello fastcp" > /tmp/fastcp_src/a.txt
-          python3 -c "import os; open('/tmp/fastcp_src/b.bin','wb').write(os.urandom(65536))"
-          python3 -c "import os; open('/tmp/fastcp_src/subdir/c.bin','wb').write(os.urandom(524288))"
-          mkdir -p /tmp/fastcp_dst
+          $src = "$env:RUNNER_TEMP\fastcp_src"
+          $dst = "$env:RUNNER_TEMP\fastcp_dst"
+          New-Item -ItemType Directory -Force "$src\subdir" | Out-Null
+          New-Item -ItemType Directory -Force $dst | Out-Null
+          Set-Content -Path "$src\a.txt" -Value "hello fastcp" -NoNewline -Encoding ascii
+
+          # Generate random binary test files
+          $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+          $buf = [byte[]]::new(65536);   $rng.GetBytes($buf)
+          [System.IO.File]::WriteAllBytes("$src\b.bin", $buf)
+          $buf = [byte[]]::new(524288);  $rng.GetBytes($buf)
+          [System.IO.File]::WriteAllBytes("$src\subdir\c.bin", $buf)
 
           # Start server in background
-          build/bin/Release/fastcp_server.exe /tmp/fastcp_src 127.0.0.1 19999 &
-          SERVER_PID=$!
+          $srv = Start-Process -FilePath "build\bin\Release\fastcp_server.exe" `
+            -ArgumentList "$src 127.0.0.1 19999" -PassThru -NoNewWindow
 
-          # Run client (--retry 30: wait up to 30s for server to be ready)
-          build/bin/Release/fastcp_client.exe /tmp/fastcp_dst 127.0.0.1 19999 --retry 30
-          CLIENT_EXIT=$?
+          # Run client (--retry 30: wait up to 30 s for server to be ready)
+          & "build\bin\Release\fastcp_client.exe" $dst 127.0.0.1 19999 --retry 30
+          $clientExit = $LASTEXITCODE
 
-          kill $SERVER_PID 2>/dev/null || true
+          Stop-Process -Id $srv.Id -Force -ErrorAction SilentlyContinue
 
-          if [ $CLIENT_EXIT -ne 0 ]; then
-            echo "FAIL: client exited with $CLIENT_EXIT"
+          if ($clientExit -ne 0) {
+            Write-Error "FAIL: client exited with $clientExit"
             exit 1
-          fi
+          }
 
-          diff /tmp/fastcp_src/a.txt /tmp/fastcp_dst/a.txt
-          diff /tmp/fastcp_src/b.bin /tmp/fastcp_dst/b.bin
-          diff /tmp/fastcp_src/subdir/c.bin /tmp/fastcp_dst/subdir/c.bin
-          echo "Windows functional test PASSED"
+          # Verify content integrity with SHA-256
+          foreach ($rel in @("a.txt", "b.bin", "subdir\c.bin")) {
+            $h1 = (Get-FileHash "$src\$rel" -Algorithm SHA256).Hash
+            $h2 = (Get-FileHash "$dst\$rel" -Algorithm SHA256).Hash
+            if ($h1 -ne $h2) { Write-Error "FAIL: $rel hash mismatch"; exit 1 }
+          }
+          Write-Host "Windows functional test PASSED"
 
       - name: Collect artifacts
         shell: bash
@@ -88,11 +97,6 @@ jobs:
 
       - name: Install dependencies
         run: sudo apt-get update && sudo apt-get install -y cmake build-essential git
-
-      - name: Clone third-party dependencies
-        run: |
-          git clone --depth=1 --branch v0.8.2 https://github.com/Cyan4973/xxHash.git third_party/xxhash
-          git clone --depth=1 --branch v1.5.5 https://github.com/facebook/zstd.git   third_party/zstd
 
       - name: Configure (Release)
         run: cmake -B build -DCMAKE_BUILD_TYPE=Release

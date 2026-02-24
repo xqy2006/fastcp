@@ -222,11 +222,6 @@ void TcpSocket::write_frame(MsgType type, u16 flags, const void* payload, u32 pa
     }
 #else
     // writev: merge header + payload into one syscall, handle partial sends
-    struct iovec iov[2];
-    iov[0].iov_base = hdr_buf;
-    iov[0].iov_len  = 8;
-    iov[1].iov_base = const_cast<void*>(payload);
-    iov[1].iov_len  = payload_len;
     size_t total = 8 + payload_len;
     size_t sent_total = 0;
     while (sent_total < total) {

@@ -269,9 +269,17 @@ int ClientApp::run() {
     tui->stop();
 
     u64 total_received = session->bytes_received.load();
-    std::cout << "Transfer complete: "
-              << utils::format_bytes(total_received)
-              << " in " << session->files_done.load() << " files\n";
+    u32 files_done     = session->files_done.load();
+    u32 files_total    = session->files_total.load();
+
+    if (total_received == 0 && files_total > 0) {
+        std::cout << "All " << files_total
+                  << " files already up to date, nothing to transfer.\n";
+    } else {
+        std::cout << "Transfer complete: "
+                  << utils::format_bytes(total_received)
+                  << " in " << files_done << " files\n";
+    }
 
     return session->done.load() ? 0 : 1;
 }

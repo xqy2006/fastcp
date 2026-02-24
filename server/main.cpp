@@ -39,6 +39,12 @@ static void print_usage(const char* prog) {
 int main(int argc, char* argv[]) {
     platform::Guard platform_guard;
 
+#ifndef _WIN32
+    // Prevent SIGPIPE from terminating the process when writing to a broken
+    // socket (writev/send on a closed peer).  We rely on errno/EPIPE instead.
+    signal(SIGPIPE, SIG_IGN);
+#endif
+
     if (argc < 4) {
         print_usage(argv[0]);
         return 1;

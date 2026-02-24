@@ -8,9 +8,6 @@ add_library(fastcp_common STATIC ${COMMON_SOURCES})
 
 target_include_directories(fastcp_common PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
-    ${CMAKE_SOURCE_DIR}/third_party/xxhash_repo
-    ${CMAKE_SOURCE_DIR}/third_party/zstd_repo/lib
-    ${CMAKE_SOURCE_DIR}/third_party/zstd_repo/lib/common
 )
 
 target_link_libraries(fastcp_common PUBLIC
