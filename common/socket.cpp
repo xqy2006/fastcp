@@ -212,6 +212,7 @@ void TcpSocket::write_frame(MsgType type, u16 flags, const void* payload, u32 pa
         DWORD sent = 0;
         int rc = WSASend(fd_, wb, cnt, &sent, 0, nullptr, nullptr);
         if (rc == SOCKET_ERROR) throw std::runtime_error("WSASend failed: " + socket_error_str(WSAGetLastError()));
+        if (sent == 0) throw std::runtime_error("WSASend: connection closed (0 bytes sent)");
         size_t n = sent;
         if (!hdr_done) {
             size_t take = std::min(n, remaining0);
@@ -244,6 +245,7 @@ void TcpSocket::write_frame(MsgType type, u16 flags, const void* payload, u32 pa
             if (errno == EINTR) continue;
             throw std::runtime_error("writev failed: " + socket_error_str(errno));
         }
+        if (n == 0) throw std::runtime_error("writev: connection closed (0 bytes sent)");
         sent_total += n;
     }
 #endif

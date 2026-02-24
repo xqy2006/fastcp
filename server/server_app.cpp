@@ -305,29 +305,24 @@ void ServerApp::handle_client(
 }
 
 void ServerApp::cleanup_threads() {
-    // Reap connector threads
+    // Reap connector threads: detach each, then clear the vector.
+    // Using an explicit loop instead of remove_if with a side-effecting
+    // predicate avoids undefined behavior when the compiler reorders or
+    // re-evaluates predicate calls during element moves.
     {
         std::lock_guard<std::mutex> lk(connector_mutex_);
-        connector_threads_.erase(
-            std::remove_if(connector_threads_.begin(), connector_threads_.end(),
-                [](std::thread& t) {
-                    if (t.joinable()) { t.detach(); return true; }
-                    return false;
-                }),
-            connector_threads_.end()
-        );
+        for (auto& t : connector_threads_) {
+            if (t.joinable()) t.detach();
+        }
+        connector_threads_.clear();
     }
     // Reap session threads
     {
         std::lock_guard<std::mutex> lk(session_threads_mutex_);
-        session_threads_.erase(
-            std::remove_if(session_threads_.begin(), session_threads_.end(),
-                [](std::thread& t) {
-                    if (t.joinable()) { t.detach(); return true; }
-                    return false;
-                }),
-            session_threads_.end()
-        );
+        for (auto& t : session_threads_) {
+            if (t.joinable()) t.detach();
+        }
+        session_threads_.clear();
     }
     // Expire stale pending sessions (> 30 s without all connections)
     {

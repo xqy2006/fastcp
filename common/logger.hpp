@@ -7,6 +7,7 @@
 #include "platform.hpp"
 #include <string>
 #include <mutex>
+#include <atomic>
 #include <fstream>
 #include <iostream>
 #include <chrono>
@@ -29,8 +30,7 @@ public:
     }
 
     void set_level(LogLevel lvl) {
-        std::lock_guard<std::mutex> lk(mutex_);
-        level_ = lvl;
+        level_.store(lvl);
     }
 
     void set_log_file(const std::string& path) {
@@ -39,7 +39,7 @@ public:
     }
 
     void log(LogLevel lvl, const std::string& msg) {
-        if (lvl < level_) return;
+        if (lvl < level_.load()) return;
         std::string line = format_line(lvl, msg);
         std::lock_guard<std::mutex> lk(mutex_);
         if (lvl >= LogLevel::WARN) {
@@ -108,7 +108,7 @@ private:
     }
 
     std::mutex    mutex_;
-    LogLevel      level_;
+    std::atomic<LogLevel> level_;
     std::ofstream file_;
     std::ofstream transfer_err_file_;
 };
