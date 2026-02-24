@@ -63,6 +63,8 @@ int main(int argc, char* argv[]) {
         } else if (std::strcmp(argv[i], "--chunk-kb") == 0 && i + 1 < argc) {
             int kb = std::atoi(argv[++i]);
             cfg.chunk_size = (u32)kb * 1024;
+        } else if (std::strcmp(argv[i], "--max-chunks") == 0 && i + 1 < argc) {
+            cfg.max_chunks = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--verbose") == 0) {
             Logger::get().set_level(LogLevel::DEBUG);
         } else {

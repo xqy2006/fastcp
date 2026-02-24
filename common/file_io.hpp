@@ -74,6 +74,8 @@ public:
 
     bool is_open() const { return data_ != nullptr; }
     u64 size() const { return size_; }
+    // Read-only view of mapped data (for chunk hash verification during resume)
+    const char* data() const { return data_; }
 
 private:
     char* data_{nullptr};

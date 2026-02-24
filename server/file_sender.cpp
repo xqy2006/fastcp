@@ -51,14 +51,12 @@ bool FileSender::send_large_file(const FileEntry& fe, u64 resume_offset, int con
     }
 
     // Calculate chunks
-    u64 start_offset = resume_offset;
     u32 total_chunks = (u32)((fe.file_size + chunk_size_ - 1) / chunk_size_);
-    u32 start_chunk  = (u32)(start_offset / chunk_size_);
 
     // Determine which connection to use for FileMeta
     int meta_conn = (conn_idx >= 0) ? conn_idx : (pool_.next_index());
 
-    // Send FileMeta on first/assigned connection
+    // Send FileMeta
     {
         FileMeta meta{};
         meta.file_id     = fe.file_id;
@@ -70,7 +68,6 @@ bool FileSender::send_large_file(const FileEntry& fe, u64 resume_offset, int con
         meta.path_len    = (u16)fe.rel_path.size();
         hash::to_bytes(fe.xxh3_128, meta.xxh3);
 
-        // Build payload = FileMeta + path
         std::vector<u8> payload(sizeof(FileMeta) + fe.rel_path.size());
         FileMeta encoded = meta;
         proto::encode_file_meta(encoded);
@@ -82,12 +79,82 @@ bool FileSender::send_large_file(const FileEntry& fe, u64 resume_offset, int con
         g.socket().write_frame(MsgType::MT_FILE_META, 0, payload.data(), (u32)payload.size());
     }
 
-    // Send chunks on the same connection as FileMeta (to maintain order)
+    // ---- Chunk-level resume protocol ----
+    // When enabled: send per-chunk hashes so the client can tell us which chunks
+    // it already has. We then skip those chunks entirely instead of re-sending.
+    // The entire hash-list + wait + reply loop happens while holding meta_conn so
+    // ordering is guaranteed on this single connection.
+    std::vector<u32> chunks_to_send;  // empty = send all from start_chunk
+
+    if (use_chunk_resume_ && total_chunks > 0 && reader) {
+        // Build CHUNK_HASH_LIST payload: header + chunk_count × u32 hashes
+        std::vector<u8> hash_payload(sizeof(ChunkHashListHdr) +
+                                     (size_t)total_chunks * sizeof(u32));
+
+        ChunkHashListHdr cl_hdr{};
+        cl_hdr.file_id     = fe.file_id;
+        cl_hdr.chunk_count = total_chunks;
+        cl_hdr.chunk_size  = chunk_size_;
+        ChunkHashListHdr encoded_cl = cl_hdr;
+        proto::encode_chunk_hash_list_hdr(encoded_cl);
+        std::memcpy(hash_payload.data(), &encoded_cl, sizeof(ChunkHashListHdr));
+
+        u8* hp = hash_payload.data() + sizeof(ChunkHashListHdr);
+        for (u32 ci = 0; ci < total_chunks; ++ci) {
+            u64 offset  = (u64)ci * chunk_size_;
+            u32 raw_len = (u32)reader->chunk_len(offset, chunk_size_);
+            u32 h = (raw_len > 0) ? hash::xxh3_32(reader->chunk_ptr(offset), raw_len) : 0;
+            u32 h_net = proto::hton32(h);
+            std::memcpy(hp + ci * sizeof(u32), &h_net, sizeof(u32));
+        }
+
+        // Send CHUNK_HASH_LIST and wait for FILE_CHUNK_REQUEST on the same connection
+        {
+            auto g = pool_.guard(meta_conn);
+            g.socket().write_frame(MsgType::MT_CHUNK_HASH_LIST, 0,
+                                   hash_payload.data(), (u32)hash_payload.size());
+
+            // Read FILE_CHUNK_REQUEST (client tells us which chunks it needs)
+            FrameHeader req_hdr{};
+            std::vector<u8> req_payload;
+            if (g.socket().read_frame(req_hdr, req_payload) &&
+                (MsgType)req_hdr.msg_type == MsgType::MT_FILE_CHUNK_REQUEST &&
+                req_payload.size() >= sizeof(FileChunkRequestHdr))
+            {
+                FileChunkRequestHdr creq{};
+                std::memcpy(&creq, req_payload.data(), sizeof(FileChunkRequestHdr));
+                proto::decode_file_chunk_request_hdr(creq);
+
+                u32 needed = creq.needed_count;
+                size_t expected = sizeof(FileChunkRequestHdr) + (size_t)needed * sizeof(u32);
+                if (req_payload.size() >= expected) {
+                    chunks_to_send.reserve(needed);
+                    const u8* idx_ptr = req_payload.data() + sizeof(FileChunkRequestHdr);
+                    for (u32 i = 0; i < needed; ++i) {
+                        u32 v;
+                        std::memcpy(&v, idx_ptr + i * sizeof(u32), sizeof(u32));
+                        chunks_to_send.push_back(proto::ntoh32(v));
+                    }
+                    LOG_DEBUG("Chunk resume: sending " + std::to_string(needed) +
+                              "/" + std::to_string(total_chunks) +
+                              " chunks for " + fe.rel_path);
+                }
+            }
+            // If we didn't get a valid response, fall through and send all chunks
+        }
+    }
+
+    // If chunk resume gave us a specific list, use it; otherwise send all
+    u32 start_chunk = (u32)(resume_offset / chunk_size_);
+    bool use_chunk_list = !chunks_to_send.empty() ||
+                          (use_chunk_resume_ && total_chunks > 0);
+
     u64 delta_bytes_skipped = 0;
-    for (u32 ci = start_chunk; ci < total_chunks; ++ci) {
+
+    auto send_one_chunk = [&](u32 ci) -> bool {
         u64 offset = (u64)ci * chunk_size_;
         u32 raw_len = (u32)reader->chunk_len(offset, chunk_size_);
-        if (raw_len == 0) break;
+        if (raw_len == 0) return true;
 
         const char* data_ptr = reader->chunk_ptr(offset);
 
@@ -95,32 +162,42 @@ bool FileSender::send_large_file(const FileEntry& fe, u64 resume_offset, int con
         if (block_matches_client(fe.file_id, ci, data_ptr, raw_len)) {
             delta_bytes_skipped += raw_len;
             tui_state_.bytes_sent.fetch_add(raw_len);
-            continue;
+            return true;
         }
 
-        // Use the assigned connection (meta_conn) for all chunks
         bool ok = false;
         {
             auto g = pool_.guard(meta_conn);
             ok = send_chunk(g.socket(), fe, ci, offset, data_ptr, raw_len, do_compress);
         }
-
         if (!ok) {
-            bool success = false;
-            for (int retry = 0; retry < 3 && !success; ++retry) {
+            for (int retry = 0; retry < 3 && !ok; ++retry) {
                 LOG_WARN("Retrying chunk " + std::to_string(ci) + " of " + fe.rel_path);
                 auto g2 = pool_.guard(meta_conn);
-                success = send_chunk(g2.socket(), fe, ci, offset, data_ptr, raw_len, do_compress);
+                ok = send_chunk(g2.socket(), fe, ci, offset, data_ptr, raw_len, do_compress);
             }
-            if (!success) {
+            if (!ok) {
                 Logger::get().transfer_error("Chunk " + std::to_string(ci) +
                     " of " + fe.rel_path + " failed after 3 retries");
                 return false;
             }
         }
-
         tui_state_.bytes_sent.fetch_add(raw_len);
+        return true;
+    };
+
+    if (use_chunk_list && !chunks_to_send.empty()) {
+        // Send only the chunks the client requested
+        for (u32 ci : chunks_to_send) {
+            if (!send_one_chunk(ci)) return false;
+        }
+    } else if (!use_chunk_resume_) {
+        // Legacy path: send all chunks from start_chunk
+        for (u32 ci = start_chunk; ci < total_chunks; ++ci) {
+            if (!send_one_chunk(ci)) return false;
+        }
     }
+    // (use_chunk_resume_ && chunks_to_send is empty means client has all chunks → skip all)
 
     if (delta_bytes_skipped > 0) {
         LOG_DEBUG("Delta: skipped " + utils::format_bytes(delta_bytes_skipped) +
@@ -133,10 +210,8 @@ bool FileSender::send_large_file(const FileEntry& fe, u64 resume_offset, int con
         end_msg.file_id    = fe.file_id;
         end_msg.total_size = fe.file_size;
         hash::to_bytes(fe.xxh3_128, end_msg.xxh3_128);
-
         FileEnd encoded = end_msg;
         proto::encode_file_end(encoded);
-
         auto g = pool_.guard(meta_conn);
         g.socket().write_frame(MsgType::MT_FILE_END, 0, &encoded, sizeof(encoded));
     }
@@ -373,6 +448,16 @@ bool FileSender::send_chunk(TcpSocket& sock,
     const u8* send_data = (const u8*)data;
     u32 send_len = raw_len;
     bool actually_compressed = false;
+
+    // Test-only chunk limit: abort session to simulate a crash
+    if (max_chunks_ > 0) {
+        int n = chunks_sent_.fetch_add(1) + 1;
+        if (n > max_chunks_) {
+            throw std::runtime_error(
+                "CHUNK_LIMIT_REACHED (test mode, limit=" +
+                std::to_string(max_chunks_) + ")");
+        }
+    }
 
     if (do_compress) {
         comp_buf = compress::compress_to_vec(data, raw_len);

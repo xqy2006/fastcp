@@ -52,13 +52,23 @@ void ConnectionHandler::run() {
 
         // Only connection 0 receives the file list and builds sync plan
         if (conn_index_ == 0) {
-            if (!handle_file_list()) {
-                LOG_ERROR("File list exchange failed");
-                return;
-            }
-            if (!build_and_send_sync_plan()) {
-                LOG_ERROR("Sync plan failed");
-                return;
+            bool use_pipeline = session_ &&
+                                (session_->capabilities & CAP_PIPELINE_SYNC);
+            if (use_pipeline) {
+                // Pipeline mode: read file tree, check files locally, send WANT_FILE
+                if (!handle_pipeline_file_tree()) {
+                    LOG_ERROR("Pipeline file tree failed");
+                    return;
+                }
+            } else {
+                if (!handle_file_list()) {
+                    LOG_ERROR("File list exchange failed");
+                    return;
+                }
+                if (!build_and_send_sync_plan()) {
+                    LOG_ERROR("Sync plan failed");
+                    return;
+                }
             }
         } else {
             // Secondary connections: wait for file list to be ready on session
@@ -222,6 +232,11 @@ bool ConnectionHandler::build_and_send_sync_plan() {
 
     sock_.write_frame(MsgType::MT_SYNC_PLAN_BEGIN, 0, nullptr, 0);
 
+    // Track which files qualify for delta sync:
+    // size matches server AND mtime differs → content partially differs → delta useful
+    struct DeltaCandidate { u32 file_id; fs::path abs_path; u64 file_size; };
+    std::vector<DeltaCandidate> delta_candidates;
+
     for (auto& cfe : file_list) {
         fs::path abs_path;
         try {
@@ -234,16 +249,17 @@ bool ConnectionHandler::build_and_send_sync_plan() {
         spe.file_id = cfe.file_id;
         spe.reserved = 0;
 
-        // Check if file already exists at destination
         std::error_code ec;
         bool exists = fs::exists(abs_path, ec);
         u64 existing_size = exists ? file_io::get_file_size(abs_path.string()) : 0;
-
-        // Check transfer index for partial progress
         u64 received = tidx.get_received(cfe.file_id);
 
-        // Fast path: size mismatch -> FULL or PARTIAL
-        if (!exists || existing_size != cfe.file_size) {
+        if (!exists) {
+            // File missing entirely → full transfer
+            spe.action = (u8)SyncAction::FULL;
+            spe.resume_offset = 0;
+        } else if (existing_size != cfe.file_size) {
+            // Size mismatch → PARTIAL if transfer_index has progress, else FULL
             if (received > 0 && received < cfe.file_size) {
                 spe.action = (u8)SyncAction::PARTIAL;
                 spe.resume_offset = received;
@@ -251,27 +267,35 @@ bool ConnectionHandler::build_and_send_sync_plan() {
                 spe.action = (u8)SyncAction::FULL;
                 spe.resume_offset = 0;
             }
-        }
-        // Size matches: compare content hash to determine if SKIP or FULL
-        else {
-            // Compute hash of local file and compare with server's hash
-            bool content_matches = false;
-            try {
-                file_io::MmapReader reader(abs_path.string());
-                if (reader.data() && reader.size() == existing_size) {
-                    hash::Hash128 local_hash = hash::xxh3_128(reader.data(), reader.size());
-                    content_matches = (std::memcmp(local_hash.data(), cfe.xxh3_128, 16) == 0);
-                }
-            } catch (...) {
-                // If we can't read, treat as FULL
-            }
-
-            if (content_matches) {
+        } else {
+            // Size matches → check mtime first (fast path)
+            u64 local_mtime = file_io::get_mtime_ns(abs_path.string());
+            if (local_mtime == cfe.mtime_ns) {
+                // mtime matches → assume content identical (rsync fast path)
                 spe.action = (u8)SyncAction::SKIP;
                 spe.resume_offset = 0;
             } else {
-                spe.action = (u8)SyncAction::FULL;
-                spe.resume_offset = 0;
+                // mtime differs, size same → compare full hash to be sure
+                bool content_matches = false;
+                try {
+                    file_io::MmapReader reader(abs_path.string());
+                    if (reader.data()) {
+                        hash::Hash128 local_hash = hash::xxh3_128(reader.data(), reader.size());
+                        content_matches = (std::memcmp(local_hash.data(), cfe.xxh3_128, 16) == 0);
+                    }
+                } catch (...) {}
+
+                if (content_matches) {
+                    spe.action = (u8)SyncAction::SKIP;
+                    spe.resume_offset = 0;
+                } else {
+                    spe.action = (u8)SyncAction::FULL;
+                    spe.resume_offset = 0;
+                    // size matches + content differs → ideal candidate for delta sync
+                    if (cfe.file_size > BUNDLE_THRESHOLD) {
+                        delta_candidates.push_back({cfe.file_id, abs_path, cfe.file_size});
+                    }
+                }
             }
         }
 
@@ -281,55 +305,36 @@ bool ConnectionHandler::build_and_send_sync_plan() {
 
     sock_.write_frame(MsgType::MT_SYNC_PLAN_END, 0, nullptr, 0);
 
-    LOG_INFO("Sync plan sent for " + std::to_string(file_list.size()) + " files");
+    LOG_INFO("Sync plan sent for " + std::to_string(file_list.size()) + " files" +
+             " (delta candidates: " + std::to_string(delta_candidates.size()) + ")");
 
-    // ---- Delta sync: send block checksums for files that exist locally ----
-    // The server will use these to skip unchanged blocks (rsync-style).
-    // We send checksums for files that are FULL (content differs) or PARTIAL.
-    // Small files (<= BUNDLE_THRESHOLD) are sent whole so no delta needed.
-    // Block size = same as server's chunk_size (stored in session).
-
+    // ---- Delta sync: send block checksums ONLY for files where
+    //      size matches server AND content differs (mtime-differ + hash-differ).
+    //      These are the only files where rsync-style block patching is useful.
+    //      Files with size mismatch (FULL/PARTIAL) or identical content (SKIP)
+    //      do NOT benefit from block checksums.
     bool use_delta = (session_->capabilities & CAP_DELTA) != 0;
-    if (use_delta) {
+    if (use_delta && !delta_candidates.empty()) {
         u32 block_size = session_->chunk_size;
         if (block_size == 0) block_size = DEFAULT_CHUNK_SIZE;
 
-        for (auto& cfe : file_list) {
-            // Only files larger than BUNDLE_THRESHOLD benefit from delta
-            if (cfe.file_size <= BUNDLE_THRESHOLD) continue;
-
-            // Determine action for this file (re-derive from what we sent)
-            fs::path abs_path;
+        for (auto& cand : delta_candidates) {
             try {
-                abs_path = file_io::proto_to_fspath(session_->root_dir, cfe.rel_path);
-            } catch (...) { continue; }
-
-            std::error_code ec;
-            bool exists = fs::exists(abs_path, ec);
-            if (!exists) continue; // no local file to compare
-
-            u64 existing_size = file_io::get_file_size(abs_path.string());
-            if (existing_size == 0) continue; // nothing to diff
-
-            // Compute block checksums for the local file
-            try {
-                file_io::MmapReader reader(abs_path.string());
+                file_io::MmapReader reader(cand.abs_path.string());
                 if (!reader.data()) continue;
 
                 u64 local_size = reader.size();
                 u32 num_blocks = (u32)((local_size + block_size - 1) / block_size);
 
-                // Build payload: BlockChecksumMsg + num_blocks * BlockChecksumEntry
                 size_t payload_size = sizeof(BlockChecksumMsg) +
                                       (size_t)num_blocks * sizeof(BlockChecksumEntry);
                 std::vector<u8> payload(payload_size);
 
                 BlockChecksumMsg hdr_msg{};
-                hdr_msg.file_id     = cfe.file_id;
+                hdr_msg.file_id     = cand.file_id;
                 hdr_msg.block_count = num_blocks;
                 hdr_msg.block_size  = block_size;
                 hdr_msg.reserved    = 0;
-
                 BlockChecksumMsg encoded_hdr = hdr_msg;
                 proto::encode_block_checksum_msg(encoded_hdr);
                 std::memcpy(payload.data(), &encoded_hdr, sizeof(BlockChecksumMsg));
@@ -343,7 +348,6 @@ bool ConnectionHandler::build_and_send_sync_plan() {
                     entry.block_index = bi;
                     entry.adler32     = hash::adler32(ptr, len);
                     entry.xxh3_32     = hash::xxh3_32(ptr, len);
-
                     BlockChecksumEntry encoded_entry = entry;
                     proto::encode_block_checksum_entry(encoded_entry);
                     std::memcpy(payload.data() + sizeof(BlockChecksumMsg) +
@@ -353,23 +357,19 @@ bool ConnectionHandler::build_and_send_sync_plan() {
 
                 sock_.write_frame(MsgType::MT_BLOCK_CHECKSUMS, 0,
                                   payload.data(), (u32)payload.size());
-
-                // Mark this file as having delta checksums sent
                 {
                     std::lock_guard<std::mutex> lk(session_->delta_sent_mutex);
-                    session_->delta_sent[cfe.file_id] = true;
+                    session_->delta_sent[cand.file_id] = true;
                 }
-
-                LOG_DEBUG("Sent " + std::to_string(num_blocks) +
-                          " block checksums for " + cfe.rel_path);
+                LOG_DEBUG("Delta: sent " + std::to_string(num_blocks) +
+                          " block checksums for file_id=" + std::to_string(cand.file_id));
             } catch (const std::exception& e) {
-                LOG_WARN("Delta: failed to read " + cfe.rel_path + ": " + e.what());
+                LOG_WARN("Delta: failed to read file_id=" +
+                         std::to_string(cand.file_id) + ": " + e.what());
             }
         }
     }
 
-    // Always send MT_BLOCK_CHECKSUMS_END to signal completion of checksum phase
-    // (even if we sent zero checksum frames, server needs to know we're done)
     sock_.write_frame(MsgType::MT_BLOCK_CHECKSUMS_END, 0, nullptr, 0);
 
     // Signal secondary connections that file list and sync plan are ready
@@ -395,7 +395,8 @@ bool ConnectionHandler::handle_transfer_loop() {
         receiver_ = std::static_pointer_cast<FileReceiver>(session_->shared_receiver);
     }
 
-    bool archive_mode = (session_->capabilities & CAP_VIRTUAL_ARCHIVE) != 0;
+    bool archive_mode = (session_->capabilities & CAP_VIRTUAL_ARCHIVE) != 0 &&
+                        !(session_->capabilities & CAP_PIPELINE_SYNC);
 
     // Secondary connections in archive mode wait until conn[0] has set up the receiver
     if (archive_mode && conn_index_ != 0) {
@@ -426,6 +427,12 @@ bool ConnectionHandler::handle_transfer_loop() {
         switch (mt) {
             case MsgType::MT_FILE_META:
                 if (!on_file_meta(payload)) return false;
+                break;
+            case MsgType::MT_CHUNK_HASH_LIST:
+                // Chunk-level resume: check local partial file and reply with needed chunks
+                if (!on_chunk_hash_list(payload)) {
+                    // Non-fatal: log and continue (server will resend all if no reply)
+                }
                 break;
             case MsgType::MT_FILE_CHUNK:
                 if (!on_file_chunk(payload)) {
@@ -572,10 +579,15 @@ bool ConnectionHandler::on_session_done() {
                  " bytes=" + utils::format_bytes(session_->bytes_received.load()) +
                  " speed=" + utils::format_speed(speed));
 
-        // Clean up the transfer index: all files successfully received,
-        // no need to keep resume state.
+        // Clean up the transfer index only if all files were fully received.
+        // If some transfers were incomplete (e.g. server stopped mid-transfer),
+        // preserve the index so the next session can resume from where it left off.
         if (session_->transfer_index) {
-            session_->transfer_index->destroy();
+            bool all_done = (session_->files_done.load() >= session_->files_total.load()
+                             && session_->files_total.load() > 0);
+            if (all_done) {
+                session_->transfer_index->destroy();
+            }
         }
     }
 
@@ -606,6 +618,189 @@ void ConnectionHandler::send_nack(u32 ref_id, u16 ref_type, u16 chunk_index, u32
 
 void ConnectionHandler::send_error(const std::string& msg) {
     sock_.write_frame(MsgType::MT_ERROR_MSG, 0, msg.data(), (u32)msg.size());
+}
+
+// ---- PIPELINE FILE TREE ----
+
+bool ConnectionHandler::handle_pipeline_file_tree() {
+    // ---- Step 1: Read server's file tree ----
+    FrameHeader hdr{}; std::vector<u8> payload;
+    if (!sock_.read_frame(hdr, payload)) return false;
+    if ((MsgType)hdr.msg_type != MsgType::MT_FILE_LIST_BEGIN) {
+        send_error("Expected FILE_LIST_BEGIN in pipeline mode");
+        return false;
+    }
+
+    for (;;) {
+        if (!sock_.read_frame(hdr, payload)) return false;
+        if ((MsgType)hdr.msg_type == MsgType::MT_FILE_LIST_END) break;
+        if ((MsgType)hdr.msg_type != MsgType::MT_FILE_LIST_ENTRY) continue;
+        if (payload.size() < sizeof(FileListEntry)) continue;
+
+        FileListEntry entry{};
+        std::memcpy(&entry, payload.data(), sizeof(FileListEntry));
+        proto::decode_file_list_entry(entry);
+
+        size_t path_off = sizeof(FileListEntry);
+        if (payload.size() < path_off + entry.path_len) continue;
+
+        ClientFileEntry cfe;
+        cfe.file_id   = entry.file_id;
+        cfe.file_size = entry.file_size;
+        cfe.mtime_ns  = entry.mtime_ns;
+        cfe.flags     = entry.flags;
+        std::memcpy(cfe.xxh3_128, entry.xxh3_128, 16);
+        cfe.rel_path.assign((char*)(payload.data() + path_off), entry.path_len);
+        session_->file_list.push_back(std::move(cfe));
+    }
+
+    session_->files_total.store((u32)session_->file_list.size());
+
+    // Signal secondary connections that they may enter handle_transfer_loop().
+    // Do this BEFORE local file checking so conn[1..N-1] are ready to receive
+    // data as soon as the server starts dispatching.
+    {
+        std::lock_guard<std::mutex> lk(session_->file_list_mutex);
+        session_->file_list_ready = true;
+    }
+    session_->file_list_cv.notify_all();
+
+    LOG_INFO("Pipeline: file tree received (" +
+             std::to_string(session_->file_list.size()) + " files)");
+
+    // ---- Step 2: Check each file, send WANT_FILE for any that need transfer ----
+    for (auto& cfe : session_->file_list) {
+        fs::path abs_path;
+        try {
+            abs_path = file_io::proto_to_fspath(session_->root_dir, cfe.rel_path);
+        } catch (...) {
+            // Cannot determine local path → request the file
+            WantFileMsg wmsg{};
+            wmsg.file_id = cfe.file_id;
+            wmsg.reason  = 0;
+            WantFileMsg enc = wmsg;
+            proto::encode_want_file_msg(enc);
+            sock_.write_frame(MsgType::MT_WANT_FILE, 0, &enc, sizeof(enc));
+            continue;
+        }
+
+        std::error_code ec;
+        bool exists    = fs::exists(abs_path, ec);
+        u64  loc_size  = exists ? file_io::get_file_size(abs_path.string()) : 0;
+
+        if (!exists || loc_size != cfe.file_size) {
+            // File missing or size mismatch → request full transfer
+            WantFileMsg wmsg{};
+            wmsg.file_id = cfe.file_id;
+            wmsg.reason  = 0;
+            WantFileMsg enc = wmsg;
+            proto::encode_want_file_msg(enc);
+            sock_.write_frame(MsgType::MT_WANT_FILE, 0, &enc, sizeof(enc));
+        } else {
+            // Size matches → check mtime (rsync fast path)
+            u64 loc_mtime = file_io::get_mtime_ns(abs_path.string());
+            if (loc_mtime == cfe.mtime_ns) {
+                // Timestamps identical → assume content up-to-date
+                session_->files_done.fetch_add(1);
+            } else {
+                // mtime differs → verify content hash if server provided one
+                bool has_server_hash = false;
+                for (int b = 0; b < 16; ++b) {
+                    if (cfe.xxh3_128[b] != 0) { has_server_hash = true; break; }
+                }
+
+                bool content_ok = false;
+                if (has_server_hash) {
+                    try {
+                        file_io::MmapReader reader(abs_path.string());
+                        if (reader.data()) {
+                            hash::Hash128 h =
+                                hash::xxh3_128(reader.data(), reader.size());
+                            content_ok =
+                                (std::memcmp(h.data(), cfe.xxh3_128, 16) == 0);
+                        }
+                    } catch (...) {}
+                }
+
+                if (content_ok) {
+                    session_->files_done.fetch_add(1); // content identical, skip
+                } else {
+                    WantFileMsg wmsg{};
+                    wmsg.file_id = cfe.file_id;
+                    wmsg.reason  = has_server_hash ? u8(2) : u8(1); // 2=hash_diff, 1=mtime_diff
+                    WantFileMsg enc = wmsg;
+                    proto::encode_want_file_msg(enc);
+                    sock_.write_frame(MsgType::MT_WANT_FILE, 0, &enc, sizeof(enc));
+                }
+            }
+        }
+    }
+
+    // ---- Step 3: Notify server that all files have been checked ----
+    sock_.write_frame(MsgType::MT_FILE_CHECK_DONE, 0, nullptr, 0);
+    LOG_INFO("Pipeline: FILE_CHECK_DONE sent");
+    return true;
+}
+
+// ---- CHUNK-LEVEL RESUME ----
+
+bool ConnectionHandler::on_chunk_hash_list(const std::vector<u8>& payload) {
+    if (payload.size() < sizeof(ChunkHashListHdr)) return false;
+
+    ChunkHashListHdr hdr{};
+    std::memcpy(&hdr, payload.data(), sizeof(ChunkHashListHdr));
+    proto::decode_chunk_hash_list_hdr(hdr);
+
+    u32 chunk_count = hdr.chunk_count;
+    size_t expected = sizeof(ChunkHashListHdr) + (size_t)chunk_count * sizeof(u32);
+    if (payload.size() < expected) {
+        LOG_WARN("on_chunk_hash_list: short payload for file_id=" +
+                 std::to_string(hdr.file_id));
+        return false;
+    }
+
+    // Decode server's per-chunk hashes (network byte order → host)
+    std::vector<u32> server_hashes(chunk_count);
+    const u8* hash_ptr = payload.data() + sizeof(ChunkHashListHdr);
+    for (u32 i = 0; i < chunk_count; ++i) {
+        u32 v;
+        std::memcpy(&v, hash_ptr + i * sizeof(u32), sizeof(u32));
+        server_hashes[i] = proto::ntoh32(v);
+    }
+
+    // Determine which chunks we still need by comparing with local partial file
+    std::vector<u32> needed;
+    if (receiver_) {
+        needed = receiver_->get_needed_chunks(
+            hdr.file_id, chunk_count, hdr.chunk_size, server_hashes.data());
+    } else {
+        // No receiver yet (shouldn't happen): request everything
+        for (u32 i = 0; i < chunk_count; ++i) needed.push_back(i);
+    }
+
+    // Build and send FILE_CHUNK_REQUEST
+    FileChunkRequestHdr req_hdr{};
+    req_hdr.file_id      = hdr.file_id;
+    req_hdr.needed_count = (u32)needed.size();
+
+    std::vector<u8> req_payload(sizeof(FileChunkRequestHdr) + needed.size() * sizeof(u32));
+    FileChunkRequestHdr encoded_req = req_hdr;
+    proto::encode_file_chunk_request_hdr(encoded_req);
+    std::memcpy(req_payload.data(), &encoded_req, sizeof(FileChunkRequestHdr));
+
+    u8* idx_ptr = req_payload.data() + sizeof(FileChunkRequestHdr);
+    for (size_t i = 0; i < needed.size(); ++i) {
+        u32 v = proto::hton32(needed[i]);
+        std::memcpy(idx_ptr + i * sizeof(u32), &v, sizeof(u32));
+    }
+
+    sock_.write_frame(MsgType::MT_FILE_CHUNK_REQUEST, 0,
+                      req_payload.data(), (u32)req_payload.size());
+
+    LOG_DEBUG("CHUNK_RESUME file_id=" + std::to_string(hdr.file_id) +
+              ": need " + std::to_string(needed.size()) +
+              "/" + std::to_string(chunk_count) + " chunks");
+    return true;
 }
 
 // ---- ARCHIVE MESSAGE HANDLERS ----

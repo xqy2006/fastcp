@@ -29,15 +29,12 @@ public:
         return it != index_.end() ? it->second : 0;
     }
 
-    // Update received bytes for file_id
+    // Update received bytes for file_id and persist immediately.
+    // Frequent persistence ensures crash recovery can resume from a recent checkpoint.
     void set_received(u32 file_id, u64 bytes) {
         std::lock_guard<std::mutex> lk(mutex_);
         index_[file_id] = bytes;
-        // Persist every 16 updates to reduce I/O on hot transfer paths
-        if (++dirty_count_ >= 16) {
-            save_locked();
-            dirty_count_ = 0;
-        }
+        save_locked();
     }
 
     // Remove entry (file fully received)
@@ -95,5 +92,4 @@ private:
     mutable std::mutex mutex_;
     std::unordered_map<u32, u64> index_;
     std::string path_;
-    int dirty_count_{0};
 };

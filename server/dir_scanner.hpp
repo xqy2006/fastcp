@@ -24,8 +24,9 @@ struct FileEntry {
     std::string abs_path;   // absolute path
     u64  file_size;
     u64  mtime_ns;
-    hash::Hash128 xxh3_128; // computed by scanner
+    hash::Hash128 xxh3_128; // computed lazily (see hash_computed)
     bool is_small;      // size <= BUNDLE_THRESHOLD
+    bool hash_computed{false}; // true once xxh3_128 has been calculated
 };
 
 // Thread-safe queue for scan results

@@ -204,3 +204,74 @@ FileReceiveState* FileReceiver::get_state(u32 file_id) {
     auto it = states_.find(file_id);
     return it != states_.end() ? it->second.get() : nullptr;
 }
+
+std::vector<u32> FileReceiver::get_needed_chunks(u32 file_id,
+                                                   u32 chunk_count,
+                                                   u32 chunk_size,
+                                                   const u32* server_hashes)
+{
+    std::vector<u32> needed;
+    FileReceiveState* state = get_state(file_id);
+    if (!state) {
+        // No state: need all chunks
+        for (u32 i = 0; i < chunk_count; ++i) needed.push_back(i);
+        return needed;
+    }
+
+    // Try to read existing file data to determine which chunks we already have.
+    // Prefer reading directly from the already-open MmapWriter to avoid Windows
+    // file sharing conflicts (MmapWriter holds a GENERIC_WRITE handle; opening a
+    // concurrent MmapReader with FILE_SHARE_READ only can cause sharing violations).
+    const char* file_data = nullptr;
+    u64          file_data_size = 0;
+
+    if (state->writer.is_open() && state->writer.data()) {
+        // Writer already has the file mapped; read directly from its view
+        file_data      = state->writer.data();
+        file_data_size = state->writer.size();
+    } else {
+        // Writer not open yet: try opening a reader (e.g. between sessions)
+        // Use a raw scope-local reader so the pointer stays valid
+    }
+
+    // We need a persistent reader for the fallback path; declare outside the block
+    std::unique_ptr<file_io::MmapReader> reader;
+    if (!file_data) {
+        try {
+            if (state->file_size > 0) {
+                reader = std::make_unique<file_io::MmapReader>(state->abs_path);
+                file_data      = reader->data();
+                file_data_size = reader->size();
+            }
+        } catch (...) {
+            // Can't read partial file: need all chunks
+            for (u32 i = 0; i < chunk_count; ++i) needed.push_back(i);
+            return needed;
+        }
+    }
+
+    for (u32 ci = 0; ci < chunk_count; ++ci) {
+        u64 offset = (u64)ci * chunk_size;
+        u64 chunk_end = offset + chunk_size;
+        u64 actual_end = std::min(chunk_end, state->file_size);
+        u32 local_len = (u32)(actual_end - offset);
+
+        bool have_chunk = false;
+        if (file_data && offset < file_data_size) {
+            u32 available = (u32)std::min((u64)local_len, file_data_size - offset);
+            if (available == local_len) {
+                u32 local_hash = hash::xxh3_32(file_data + offset, local_len);
+                have_chunk = (local_hash == server_hashes[ci]);
+            }
+        }
+
+        if (!have_chunk) {
+            needed.push_back(ci);
+        }
+    }
+
+    LOG_DEBUG("Chunk resume: file_id=" + std::to_string(file_id) +
+              " total=" + std::to_string(chunk_count) +
+              " needed=" + std::to_string(needed.size()));
+    return needed;
+}

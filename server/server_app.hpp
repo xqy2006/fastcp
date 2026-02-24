@@ -39,6 +39,7 @@ struct ServerConfig {
     int         num_conns{4};   // parallel connections expected per client
     bool        use_compress{true};
     u32         chunk_size{DEFAULT_CHUNK_SIZE};
+    int         max_chunks{0};  // test-only: abort after N chunks (0=unlimited)
 };
 
 // Sync plan received from the client during negotiation
@@ -106,6 +107,7 @@ private:
     bool do_handshake_peeked(int conn_idx);
 
     bool phase_file_list(SyncPlanMap& plan_out);
+    bool phase_pipeline_sync();
     bool phase_transfer(const SyncPlanMap& plan);
     bool phase_transfer_archive(const SyncPlanMap& plan);
     bool phase_done();

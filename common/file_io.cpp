@@ -121,13 +121,14 @@ void MmapWriter::open(const std::string& file_path, u64 size, bool resume) {
 
 #ifdef _WIN32
     // resume=true: open existing file without truncating
+    // FILE_SHARE_READ: allow concurrent MmapReader to verify existing chunks
     DWORD creation = resume ? OPEN_EXISTING : CREATE_ALWAYS;
-    file_handle_ = CreateFileA(file_path.c_str(), GENERIC_READ | GENERIC_WRITE, 0,
+    file_handle_ = CreateFileA(file_path.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ,
                                nullptr, creation, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (file_handle_ == INVALID_HANDLE_VALUE) {
         if (resume) {
             // Fallback to creating if file doesn't exist yet
-            file_handle_ = CreateFileA(file_path.c_str(), GENERIC_READ | GENERIC_WRITE, 0,
+            file_handle_ = CreateFileA(file_path.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ,
                                        nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
         }
         if (file_handle_ == INVALID_HANDLE_VALUE) {

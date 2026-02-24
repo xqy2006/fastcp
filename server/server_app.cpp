@@ -5,12 +5,15 @@
 #include "server_app.hpp"
 #include "archive_builder.hpp"
 #include "../common/protocol_io.hpp"
+#include "../common/file_io.hpp"
+#include "../common/hash.hpp"
 #include "../common/logger.hpp"
 #include "../common/utils.hpp"
 #include <thread>
 #include <algorithm>
 #include <cstring>
 #include <vector>
+#include <deque>
 #include <chrono>
 #include <iostream>
 
@@ -27,13 +30,14 @@ ServerApp::~ServerApp() {
 }
 
 int ServerApp::run() {
-    // Scan source directory once at startup; entries reused for every client
+    // Scan source directory: stat-only (no hash computation) so the server
+    // starts listening almost immediately regardless of directory size.
     LOG_INFO("Scanning source directory: " + config_.src_dir);
     DirScanner scanner(config_.src_dir);
     scanner.start_async();
     {
         std::lock_guard<std::mutex> lk(entries_mutex_);
-        entries_     = scanner.get_all();
+        entries_     = scanner.get_all();   // fast: only stat() calls now
         total_bytes_ = scanner.total_bytes();
     }
 
@@ -41,8 +45,43 @@ int ServerApp::run() {
         LOG_WARN("Source directory is empty.");
     } else {
         LOG_INFO("Ready: " + std::to_string(entries_.size()) +
-                 " files (" + utils::format_bytes(total_bytes_) + ")");
+                 " files (" + utils::format_bytes(total_bytes_) + ")" +
+                 " – computing hashes in background");
     }
+
+    // Background thread: compute file hashes so subsequent sessions benefit
+    // from cached values.  Uses a local copy to avoid holding entries_mutex_
+    // while doing I/O, then flushes computed hashes back under lock.
+    std::thread bg_hasher([this]() {
+        std::vector<FileEntry> local;
+        {
+            std::lock_guard<std::mutex> lk(entries_mutex_);
+            local = entries_;
+        }
+        for (auto& fe : local) {
+            if (fe.hash_computed) continue;
+            if (fe.file_size == 0) {
+                fe.xxh3_128     = hash::xxh3_128(nullptr, 0);
+                fe.hash_computed = true;
+            } else {
+                try {
+                    file_io::MmapReader reader(fe.abs_path);
+                    fe.xxh3_128     = hash::xxh3_128(reader.data(), (size_t)reader.size());
+                    fe.hash_computed = true;
+                } catch (...) {}
+            }
+        }
+        // Flush computed hashes back to entries_
+        std::lock_guard<std::mutex> lk(entries_mutex_);
+        for (size_t i = 0; i < entries_.size() && i < local.size(); ++i) {
+            if (local[i].hash_computed && !entries_[i].hash_computed) {
+                entries_[i].xxh3_128     = local[i].xxh3_128;
+                entries_[i].hash_computed = true;
+            }
+        }
+        LOG_INFO("Background hash computation complete");
+    });
+    bg_hasher.detach();
 
     // Bind and listen
     listen_sock_.bind_and_listen(config_.listen_ip, config_.listen_port);
@@ -169,7 +208,8 @@ void ServerApp::connector_thread(TcpSocket sock) {
             // negotiate capabilities, send ACK immediately.
             sid = generate_session_id();
 
-        u16 server_caps = CAP_COMPRESS | CAP_RESUME | CAP_BUNDLE | CAP_DELTA | CAP_VIRTUAL_ARCHIVE;
+        u16 server_caps = CAP_COMPRESS | CAP_RESUME | CAP_BUNDLE | CAP_DELTA | CAP_VIRTUAL_ARCHIVE
+                        | CAP_CHUNK_RESUME | CAP_PIPELINE_SYNC;
             if (!config_.use_compress) server_caps &= ~CAP_COMPRESS;
             agreed_caps       = req.capabilities & server_caps;
             agreed_chunk_size = config_.chunk_size;
@@ -388,20 +428,28 @@ int ClientSession::run() {
         return 1;
     }
 
-    SyncPlanMap plan;
-    if (!phase_file_list(plan)) {
-        LOG_ERROR("File list exchange failed");
-        tui_->stop();
-        return 1;
-    }
-
-    if (agreed_caps_ & CAP_VIRTUAL_ARCHIVE) {
-        if (!phase_transfer_archive(plan)) {
-            LOG_WARN("Archive transfer completed with some errors");
+    if (agreed_caps_ & CAP_PIPELINE_SYNC) {
+        // Pipeline sync: server streams file tree while client sends WANT_FILE,
+        // decoupling local file checking from network transfer.
+        if (!phase_pipeline_sync()) {
+            LOG_WARN("Pipeline sync completed with some errors");
         }
     } else {
-        if (!phase_transfer(plan)) {
-            LOG_WARN("Transfer completed with some errors");
+        SyncPlanMap plan;
+        if (!phase_file_list(plan)) {
+            LOG_ERROR("File list exchange failed");
+            tui_->stop();
+            return 1;
+        }
+
+        if (agreed_caps_ & CAP_VIRTUAL_ARCHIVE) {
+            if (!phase_transfer_archive(plan)) {
+                LOG_WARN("Archive transfer completed with some errors");
+            }
+        } else {
+            if (!phase_transfer(plan)) {
+                LOG_WARN("Transfer completed with some errors");
+            }
         }
     }
 
@@ -467,10 +515,28 @@ bool ClientSession::do_handshake_peeked(int conn_idx) {
 bool ClientSession::phase_file_list(SyncPlanMap& plan_out) {
     TcpSocket& sock = pool_.get(0);
 
-    // Send file list
+    // Send file list; compute hash on-demand for entries not yet hashed.
+    // Each ClientSession owns its own copy of entries_, so no cross-session locking.
     sock.write_frame(MsgType::MT_FILE_LIST_BEGIN, 0, nullptr, 0);
 
     for (auto& fe : entries_) {
+        // Lazy hash computation: only happens for files the background hasher
+        // hasn't reached yet.  Result is cached in this session's local copy.
+        if (!fe.hash_computed) {
+            if (fe.file_size == 0) {
+                fe.xxh3_128     = hash::xxh3_128(nullptr, 0);
+                fe.hash_computed = true;
+            } else {
+                try {
+                    file_io::MmapReader reader(fe.abs_path);
+                    fe.xxh3_128     = hash::xxh3_128(reader.data(), (size_t)reader.size());
+                    fe.hash_computed = true;
+                } catch (const std::exception& e) {
+                    LOG_WARN("Cannot hash " + fe.abs_path + ": " + e.what());
+                }
+            }
+        }
+
         FileListEntry fle{};
         fle.file_id   = fe.file_id;
         fle.file_size = fe.file_size;
@@ -589,6 +655,12 @@ bool ClientSession::phase_file_list(SyncPlanMap& plan_out) {
 bool ClientSession::phase_transfer(const SyncPlanMap& plan) {
     FileSender sender(pool_, tui_state_, cfg_.use_compress, agreed_chunk_size_,
                       delta_checksums_, delta_block_sizes_);
+    if (agreed_caps_ & CAP_CHUNK_RESUME) {
+        sender.set_chunk_resume(true);
+    }
+    if (cfg_.max_chunks > 0) {
+        sender.set_max_chunks(cfg_.max_chunks);
+    }
 
     // Separate small files (bundles) and large files (parallel)
     std::vector<const FileEntry*> small_files;
@@ -891,6 +963,185 @@ bool ClientSession::phase_transfer_archive(const SyncPlanMap& plan) {
 }
 
 
+
+bool ClientSession::phase_pipeline_sync() {
+    int num_conns = pool_.size();
+    TcpSocket& conn0 = pool_.get(0);
+
+    // Build file_id → entry lookup for fast dispatch
+    std::unordered_map<u32, const FileEntry*> file_map;
+    file_map.reserve(entries_.size());
+    for (auto& fe : entries_) file_map[fe.file_id] = &fe;
+
+    // ---- Step 1: Stream file tree to client on conn[0] ----
+    // Reuse the FILE_LIST_ENTRY wire format (path, size, mtime, hash).
+    // Hash is computed lazily; a zero hash tells the client to fall back to
+    // mtime-only comparison for that entry.
+    conn0.write_frame(MsgType::MT_FILE_LIST_BEGIN, 0, nullptr, 0);
+
+    for (auto& fe : entries_) {
+        // Lazy hash computation (same pattern as phase_file_list)
+        if (!fe.hash_computed) {
+            if (fe.file_size == 0) {
+                fe.xxh3_128      = hash::xxh3_128(nullptr, 0);
+                fe.hash_computed = true;
+            } else {
+                try {
+                    file_io::MmapReader reader(fe.abs_path);
+                    fe.xxh3_128      = hash::xxh3_128(reader.data(), (size_t)reader.size());
+                    fe.hash_computed = true;
+                } catch (const std::exception& e) {
+                    LOG_WARN("phase_pipeline_sync: cannot hash " +
+                             fe.abs_path + ": " + e.what());
+                }
+            }
+        }
+
+        FileListEntry fle{};
+        fle.file_id   = fe.file_id;
+        fle.file_size = fe.file_size;
+        fle.mtime_ns  = fe.mtime_ns;
+        fle.path_len  = (u16)fe.rel_path.size();
+        fle.flags     = 0;
+        hash::to_bytes(fe.xxh3_128, fle.xxh3_128);
+
+        std::vector<u8> payload(sizeof(FileListEntry) + fe.rel_path.size());
+        FileListEntry encoded = fle;
+        proto::encode_file_list_entry(encoded);
+        std::memcpy(payload.data(), &encoded, sizeof(FileListEntry));
+        std::memcpy(payload.data() + sizeof(FileListEntry),
+                    fe.rel_path.data(), fe.rel_path.size());
+
+        conn0.write_frame(MsgType::MT_FILE_LIST_ENTRY, 0,
+                          payload.data(), (u32)payload.size());
+    }
+    conn0.write_frame(MsgType::MT_FILE_LIST_END, 0, nullptr, 0);
+
+    LOG_INFO("Pipeline: sent file tree (" +
+             std::to_string(entries_.size()) + " entries)");
+
+    // ---- Step 2: Set up file dispatch ----
+    // Pipeline mode does not exchange delta-sync block checksums; use empty maps.
+    FileSender sender(pool_, tui_state_, cfg_.use_compress, agreed_chunk_size_,
+                      empty_delta_checksums(), empty_delta_block_sizes());
+    if (agreed_caps_ & CAP_CHUNK_RESUME) {
+        sender.set_chunk_resume(true);
+    }
+    if (cfg_.max_chunks > 0) {
+        sender.set_max_chunks(cfg_.max_chunks);
+    }
+
+    std::mutex          want_mutex;
+    std::deque<u32>     want_queue;          // file_ids the client requested
+    std::atomic<bool>   check_done{false};   // set when MT_FILE_CHECK_DONE is received
+    std::atomic<int>    round_robin{0};      // round-robin counter for data conns
+
+    // dispatch_file: find the FileEntry and send it on a data connection.
+    // Returns false if the chunk limit was reached (test mode), true otherwise.
+    auto dispatch_file = [&](u32 fid) -> bool {
+        auto it = file_map.find(fid);
+        if (it == file_map.end()) {
+            LOG_WARN("Pipeline dispatch: unknown file_id=" + std::to_string(fid));
+            return true;
+        }
+        const FileEntry& fe = *it->second;
+
+        // Use conn[1..N-1] when available; fall back to conn[0] for single-conn sessions
+        int ci;
+        if (num_conns > 1) {
+            int v = round_robin.fetch_add(1);
+            ci = 1 + (v % (num_conns - 1));
+        } else {
+            ci = 0;
+        }
+
+        try {
+            if (fe.is_small) {
+                sender.send_bundle({&fe}, ci);
+            } else {
+                sender.init_file_tracking(fe.file_id, 1);
+                sender.send_large_file(fe, /*resume_offset=*/0, ci);
+            }
+            tui_state_.files_done.fetch_add(1);
+        } catch (const std::runtime_error& e) {
+            // Test-mode chunk limit reached: stop dispatching gracefully
+            LOG_WARN("Pipeline dispatch stopped: " + std::string(e.what()));
+            check_done.store(true);
+            return false;
+        }
+        return true;
+    };
+
+    // drain_queue_mt: pop all pending file_ids and dispatch them (thread-safe).
+    // Stops early if dispatch_file signals chunk limit reached.
+    auto drain_queue_mt = [&]() {
+        std::deque<u32> local;
+        {
+            std::lock_guard<std::mutex> lk(want_mutex);
+            local.swap(want_queue);
+        }
+        for (u32 fid : local) {
+            if (!dispatch_file(fid)) break; // chunk limit reached
+        }
+    };
+
+    // ---- N=1 fast path: must finish reading before sending (single connection) ----
+    if (num_conns == 1) {
+        std::vector<u32> want_list;
+        for (;;) {
+            FrameHeader hdr{}; std::vector<u8> pl;
+            if (!conn0.read_frame(hdr, pl)) break;
+            if ((MsgType)hdr.msg_type == MsgType::MT_FILE_CHECK_DONE) break;
+            if ((MsgType)hdr.msg_type == MsgType::MT_WANT_FILE &&
+                pl.size() >= sizeof(WantFileMsg))
+            {
+                WantFileMsg wmsg{};
+                std::memcpy(&wmsg, pl.data(), sizeof(WantFileMsg));
+                proto::decode_want_file_msg(wmsg);
+                want_list.push_back(wmsg.file_id);
+            }
+        }
+        for (u32 fid : want_list) {
+            if (!dispatch_file(fid)) break; // chunk limit reached
+        }
+        return true;
+    }
+
+    // ---- N>1: time-based dispatcher running in parallel with WANT_FILE reader ----
+    // Dispatcher thread: every 100 ms pop from want_queue and send on conn[1..N-1].
+    std::thread dispatcher([&]() {
+        using ms = std::chrono::milliseconds;
+        while (!check_done.load()) {
+            std::this_thread::sleep_for(ms(100));
+            drain_queue_mt();
+        }
+        drain_queue_mt(); // final flush after FILE_CHECK_DONE
+    });
+
+    // Main thread: read WANT_FILE messages until FILE_CHECK_DONE
+    for (;;) {
+        FrameHeader hdr{}; std::vector<u8> pl;
+        if (!conn0.read_frame(hdr, pl)) break;
+        if ((MsgType)hdr.msg_type == MsgType::MT_FILE_CHECK_DONE) break;
+        if ((MsgType)hdr.msg_type == MsgType::MT_WANT_FILE &&
+            pl.size() >= sizeof(WantFileMsg))
+        {
+            WantFileMsg wmsg{};
+            std::memcpy(&wmsg, pl.data(), sizeof(WantFileMsg));
+            proto::decode_want_file_msg(wmsg);
+            {
+                std::lock_guard<std::mutex> lk(want_mutex);
+                want_queue.push_back(wmsg.file_id);
+            }
+        }
+    }
+
+    check_done.store(true);
+    dispatcher.join();
+
+    LOG_INFO("Pipeline: all requested files dispatched");
+    return true;
+}
 
 bool ClientSession::phase_done() {
     bool all_ok = true;

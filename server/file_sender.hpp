@@ -55,8 +55,16 @@ public:
 
     // ---- Single-threaded API (backward compatible) ----
 
-    // Send a large file on a specific connection (legacy, single-threaded)
+    // Send a large file on a specific connection (legacy, single-threaded).
+    // When use_chunk_resume_ is true the server first sends a CHUNK_HASH_LIST so
+    // the client can reply with which chunks it still needs (partial-file resume).
     bool send_large_file(const FileEntry& fe, u64 resume_offset, int conn_idx = -1);
+
+    // Enable chunk-level resume protocol (CAP_CHUNK_RESUME negotiated)
+    void set_chunk_resume(bool enabled) { use_chunk_resume_ = enabled; }
+
+    // Test helper: abort the session after sending N chunks (0 = unlimited)
+    void set_max_chunks(int n) { max_chunks_ = n; chunks_sent_.store(0); }
 
     // Bundle multiple small files and send on one connection
     bool send_bundle(const std::vector<const FileEntry*>& files, int conn_idx = 0);
@@ -105,8 +113,13 @@ private:
     TuiState&       tui_state_;
     bool            use_compress_;
     u32             chunk_size_;
+    bool            use_chunk_resume_{false};
     const DeltaChecksumMap&  delta_checksums_;
     const DeltaBlockSizeMap& delta_block_sizes_;
+
+    // Test-only: abort after this many chunks (0 = unlimited)
+    int                  max_chunks_{0};
+    std::atomic<int>     chunks_sent_{0};
 
     std::mutex retry_mutex_;
     std::vector<ChunkRetry> pending_retries_;

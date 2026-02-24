@@ -75,6 +75,17 @@ private:
     bool on_archive_chunk(const std::vector<u8>& payload);
     bool on_archive_done();
 
+    // ---- Chunk-level resume ----
+    // Receives CHUNK_HASH_LIST from server, checks local partial file, replies with
+    // FILE_CHUNK_REQUEST containing only the chunks the client still needs.
+    bool on_chunk_hash_list(const std::vector<u8>& payload);
+
+    // ---- Pipeline sync ----
+    // Reads server's file tree (FILE_LIST_ENTRY stream), checks each file locally,
+    // sends MT_WANT_FILE for each file that needs transfer, then sends
+    // MT_FILE_CHECK_DONE when all files have been inspected.
+    bool handle_pipeline_file_tree();
+
     void send_ack(u32 ref_id, u16 ref_type, u16 chunk_index, u32 status = 0);
     void send_nack(u32 ref_id, u16 ref_type, u16 chunk_index, u32 error_code);
     void send_error(const std::string& msg);

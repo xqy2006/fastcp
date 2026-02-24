@@ -60,6 +60,14 @@ public:
                           const std::string& rel_path,
                           const u8* data, u64 data_len);
 
+    // Chunk-level resume: compare server's per-chunk hashes against local partial file.
+    // Returns the list of chunk indices the client still needs (missing or hash mismatch).
+    // Called after on_file_meta so FileReceiveState (with abs_path) is already set up.
+    std::vector<u32> get_needed_chunks(u32 file_id,
+                                        u32 chunk_count,
+                                        u32 chunk_size,
+                                        const u32* server_hashes);
+
     // Lookup active receive state
     FileReceiveState* get_state(u32 file_id);
 

@@ -38,20 +38,9 @@ FileEntry DirScanner::make_entry(const fs::path& abs_path, const fs::path& rel_p
     fe.file_size = file_io::get_file_size(abs_path.string());
     fe.mtime_ns  = file_io::get_mtime_ns(abs_path.string());
     fe.is_small  = fe.file_size <= BUNDLE_THRESHOLD;
-
-    // Compute xxh3_128
-    if (fe.file_size == 0) {
-        fe.xxh3_128 = hash::xxh3_128(nullptr, 0);
-    } else {
-        try {
-            file_io::MmapReader reader(abs_path.string());
-            fe.xxh3_128 = hash::xxh3_128(reader.data(), (size_t)reader.size());
-        } catch (const std::exception& e) {
-            LOG_WARN("Cannot hash file " + fe.abs_path + ": " + e.what());
-            fe.xxh3_128 = {};
-        }
-    }
-
+    // Hash is computed lazily in phase_file_list to avoid blocking server startup
+    fe.xxh3_128     = {};
+    fe.hash_computed = false;
     return fe;
 }
 

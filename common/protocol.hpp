@@ -52,6 +52,14 @@ enum class MsgType : u16 {
     MT_BLOCK_CHECKSUMS     = 0x0080,  // payload: BlockChecksumMsg header + BlockChecksumEntry[]
     MT_BLOCK_CHECKSUMS_END = 0x0081,  // no payload; signals end of checksum stream
 
+    // Chunk-level resume: server sends per-chunk hashes; client replies with needed chunks
+    MT_CHUNK_HASH_LIST     = 0x0120,  // server→client: ChunkHashListHdr + u32[chunk_count]
+    MT_FILE_CHUNK_REQUEST  = 0x0121,  // client→server: FileChunkRequestHdr + u32[needed_count]
+
+    // Pipeline streaming sync: client sends needed-file notifications while server streams file tree
+    MT_WANT_FILE           = 0x0130,  // client→server: WantFileMsg (request transfer of one file)
+    MT_FILE_CHECK_DONE     = 0x0131,  // client→server: all files checked, no more WANT_FILE coming
+
     // Virtual Archive (Steam Depot style): treat all files as one virtual byte stream
     MT_ARCHIVE_MANIFEST_HDR = 0x0090, // total size, file count, chunk size, chunk count
     MT_ARCHIVE_FILE_ENTRY   = 0x0091, // one file entry in the manifest
@@ -84,6 +92,8 @@ enum Capabilities : u16 {
     CAP_BUNDLE           = 0x0004,
     CAP_DELTA            = 0x0008,  // delta-sync (block-level checksum exchange)
     CAP_VIRTUAL_ARCHIVE  = 0x0010,  // virtual archive (Steam Depot style streaming)
+    CAP_CHUNK_RESUME     = 0x0020,  // chunk-level resume (per-chunk hash verification)
+    CAP_PIPELINE_SYNC    = 0x0040,  // pipeline sync (WANT_FILE streaming, decoupled transfer)
 };
 
 // ---- Compress algo ----
@@ -280,6 +290,33 @@ struct ArchiveChunkHdr {
     u8  pad[3];
 };
 static_assert(sizeof(ArchiveChunkHdr) == 28, "ArchiveChunkHdr size mismatch");
+
+// ---- Chunk-level resume structures ----
+
+// ChunkHashListHdr: 12 bytes, followed by chunk_count × u32 (xxh3_32 per chunk)
+struct ChunkHashListHdr {
+    u32 file_id;
+    u32 chunk_count;
+    u32 chunk_size;   // bytes per chunk
+};
+static_assert(sizeof(ChunkHashListHdr) == 12, "ChunkHashListHdr size mismatch");
+
+// FileChunkRequestHdr: 8 bytes, followed by needed_count × u32 (chunk indices)
+struct FileChunkRequestHdr {
+    u32 file_id;
+    u32 needed_count;
+};
+static_assert(sizeof(FileChunkRequestHdr) == 8, "FileChunkRequestHdr size mismatch");
+
+// ---- Pipeline sync structures ----
+
+// WantFileMsg: 8 bytes – client tells server it needs a specific file
+struct WantFileMsg {
+    u32 file_id;
+    u8  reason;   // 0=file missing, 1=mtime differs, 2=hash differs
+    u8  pad[3];
+};
+static_assert(sizeof(WantFileMsg) == 8, "WantFileMsg size mismatch");
 
 #pragma pack(pop)
 

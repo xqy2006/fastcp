@@ -329,4 +329,38 @@ inline void decode_archive_chunk_hdr(ArchiveChunkHdr& h) {
     h.xxh3_32        = ntoh32(h.xxh3_32);
 }
 
+// ---- Chunk-level resume ----
+
+inline void encode_chunk_hash_list_hdr(ChunkHashListHdr& h) {
+    h.file_id     = hton32(h.file_id);
+    h.chunk_count = hton32(h.chunk_count);
+    h.chunk_size  = hton32(h.chunk_size);
+}
+
+inline void decode_chunk_hash_list_hdr(ChunkHashListHdr& h) {
+    h.file_id     = ntoh32(h.file_id);
+    h.chunk_count = ntoh32(h.chunk_count);
+    h.chunk_size  = ntoh32(h.chunk_size);
+}
+
+inline void encode_file_chunk_request_hdr(FileChunkRequestHdr& h) {
+    h.file_id      = hton32(h.file_id);
+    h.needed_count = hton32(h.needed_count);
+}
+
+inline void decode_file_chunk_request_hdr(FileChunkRequestHdr& h) {
+    h.file_id      = ntoh32(h.file_id);
+    h.needed_count = ntoh32(h.needed_count);
+}
+
+// ---- Pipeline sync ----
+
+inline void encode_want_file_msg(WantFileMsg& m) {
+    m.file_id = hton32(m.file_id);
+}
+
+inline void decode_want_file_msg(WantFileMsg& m) {
+    m.file_id = ntoh32(m.file_id);
+}
+
 } // namespace proto
