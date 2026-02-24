@@ -84,8 +84,14 @@ private:
         auto ms  = std::chrono::duration_cast<std::chrono::milliseconds>(
                        now.time_since_epoch()) % 1000;
 
+        std::tm tm_buf{};
+#ifdef _WIN32
+        localtime_s(&tm_buf, &t);
+#else
+        localtime_r(&t, &tm_buf);
+#endif
         std::ostringstream ss;
-        ss << std::put_time(std::localtime(&t), "%Y-%m-%d %H:%M:%S");
+        ss << std::put_time(&tm_buf, "%Y-%m-%d %H:%M:%S");
         ss << '.' << std::setfill('0') << std::setw(3) << ms.count();
         ss << " [" << level_str(lvl) << "] " << msg;
         return ss.str();
