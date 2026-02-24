@@ -273,4 +273,60 @@ inline void decode_block_checksum_entry(BlockChecksumEntry& e) {
     e.xxh3_32     = ntoh32(e.xxh3_32);
 }
 
+// ---- Virtual Archive ----
+
+inline void encode_archive_manifest_hdr(ArchiveManifestHdr& h) {
+    h.total_virtual_size = hton64(h.total_virtual_size);
+    h.total_files        = hton32(h.total_files);
+    h.chunk_size         = hton32(h.chunk_size);
+    h.total_chunks       = hton32(h.total_chunks);
+}
+
+inline void decode_archive_manifest_hdr(ArchiveManifestHdr& h) {
+    h.total_virtual_size = ntoh64(h.total_virtual_size);
+    h.total_files        = ntoh32(h.total_files);
+    h.chunk_size         = ntoh32(h.chunk_size);
+    h.total_chunks       = ntoh32(h.total_chunks);
+}
+
+inline void encode_archive_file_entry(ArchiveFileEntry& e) {
+    e.file_id        = hton32(e.file_id);
+    e.virtual_offset = hton64(e.virtual_offset);
+    e.file_size      = hton64(e.file_size);
+    e.mtime_ns       = hton64(e.mtime_ns);
+    e.path_len       = hton16(e.path_len);
+}
+
+inline void decode_archive_file_entry(ArchiveFileEntry& e) {
+    e.file_id        = ntoh32(e.file_id);
+    e.virtual_offset = ntoh64(e.virtual_offset);
+    e.file_size      = ntoh64(e.file_size);
+    e.mtime_ns       = ntoh64(e.mtime_ns);
+    e.path_len       = ntoh16(e.path_len);
+}
+
+inline void encode_chunk_request_hdr(ChunkRequestHdr& h) {
+    h.needed_count = hton32(h.needed_count);
+}
+
+inline void decode_chunk_request_hdr(ChunkRequestHdr& h) {
+    h.needed_count = ntoh32(h.needed_count);
+}
+
+inline void encode_archive_chunk_hdr(ArchiveChunkHdr& h) {
+    h.chunk_id       = hton32(h.chunk_id);
+    h.archive_offset = hton64(h.archive_offset);
+    h.data_len       = hton32(h.data_len);
+    h.raw_len        = hton32(h.raw_len);
+    h.xxh3_32        = hton32(h.xxh3_32);
+}
+
+inline void decode_archive_chunk_hdr(ArchiveChunkHdr& h) {
+    h.chunk_id       = ntoh32(h.chunk_id);
+    h.archive_offset = ntoh64(h.archive_offset);
+    h.data_len       = ntoh32(h.data_len);
+    h.raw_len        = ntoh32(h.raw_len);
+    h.xxh3_32        = ntoh32(h.xxh3_32);
+}
+
 } // namespace proto

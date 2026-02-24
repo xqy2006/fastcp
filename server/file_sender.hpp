@@ -14,6 +14,7 @@
 #include "../common/socket.hpp"
 #include "dir_scanner.hpp"
 #include "connection_pool.hpp"
+#include "archive_builder.hpp"
 #include "tui.hpp"
 #include <vector>
 #include <unordered_map>
@@ -91,6 +92,13 @@ public:
     // Initialize per-file parallel tracking.
     // MUST be called from the spawning thread BEFORE any worker threads start.
     void init_file_tracking(u32 file_id, int num_threads);
+
+    // ---- Virtual Archive API ----
+
+    // Send a range of archive chunks on conn_idx, then send MT_ARCHIVE_DONE.
+    bool send_archive_range(const ArchiveBuilder& archive,
+                            const std::vector<u32>& chunk_ids,
+                            int conn_idx);
 
 private:
     ConnectionPool& pool_;

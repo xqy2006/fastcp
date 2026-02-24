@@ -51,6 +51,14 @@ enum class MsgType : u16 {
     // Delta sync: client sends block checksums so server can skip unchanged blocks
     MT_BLOCK_CHECKSUMS     = 0x0080,  // payload: BlockChecksumMsg header + BlockChecksumEntry[]
     MT_BLOCK_CHECKSUMS_END = 0x0081,  // no payload; signals end of checksum stream
+
+    // Virtual Archive (Steam Depot style): treat all files as one virtual byte stream
+    MT_ARCHIVE_MANIFEST_HDR = 0x0090, // total size, file count, chunk size, chunk count
+    MT_ARCHIVE_FILE_ENTRY   = 0x0091, // one file entry in the manifest
+    MT_ARCHIVE_MANIFEST_END = 0x0092, // end of manifest
+    MT_CHUNK_REQUEST        = 0x00A0, // client requests which chunks it needs
+    MT_ARCHIVE_CHUNK        = 0x00B0, // one archive chunk (may span multiple files)
+    MT_ARCHIVE_DONE         = 0x00B1, // server done sending on this connection
 };
 
 // ---- Frame Header (8 bytes, big-endian on wire) ----
@@ -71,10 +79,11 @@ enum class SyncAction : u8 {
 
 // ---- Capabilities bits ----
 enum Capabilities : u16 {
-    CAP_COMPRESS = 0x0001,
-    CAP_RESUME   = 0x0002,
-    CAP_BUNDLE   = 0x0004,
-    CAP_DELTA    = 0x0008,  // delta-sync (block-level checksum exchange)
+    CAP_COMPRESS         = 0x0001,
+    CAP_RESUME           = 0x0002,
+    CAP_BUNDLE           = 0x0004,
+    CAP_DELTA            = 0x0008,  // delta-sync (block-level checksum exchange)
+    CAP_VIRTUAL_ARCHIVE  = 0x0010,  // virtual archive (Steam Depot style streaming)
 };
 
 // ---- Compress algo ----
@@ -227,6 +236,50 @@ struct BlockChecksumEntry {
     u32 xxh3_32;
 };
 static_assert(sizeof(BlockChecksumEntry) == 12, "BlockChecksumEntry size mismatch");
+
+// ---- Virtual Archive structures ----
+
+// ArchiveManifestHdr: 24 bytes
+struct ArchiveManifestHdr {
+    u64 total_virtual_size;  // sum of all file sizes in this archive
+    u32 total_files;
+    u32 chunk_size;          // fixed chunk size in bytes
+    u32 total_chunks;
+    u8  pad[4];
+};
+static_assert(sizeof(ArchiveManifestHdr) == 24, "ArchiveManifestHdr size mismatch");
+
+// ArchiveFileEntry: 48 bytes fixed + path
+struct ArchiveFileEntry {
+    u32 file_id;
+    u64 virtual_offset;      // byte offset of this file in the virtual stream
+    u64 file_size;
+    u64 mtime_ns;
+    u8  xxh3_128[16];
+    u16 path_len;
+    u8  flags;
+    u8  pad[1];
+};
+static_assert(sizeof(ArchiveFileEntry) == 48, "ArchiveFileEntry size mismatch");
+
+// ChunkRequestHdr: 8 bytes, followed by needed_count × u32 chunk_ids
+struct ChunkRequestHdr {
+    u32 needed_count;
+    u8  pad[4];
+};
+static_assert(sizeof(ChunkRequestHdr) == 8, "ChunkRequestHdr size mismatch");
+
+// ArchiveChunkHdr: 28 bytes fixed + data
+struct ArchiveChunkHdr {
+    u32 chunk_id;
+    u64 archive_offset;      // byte offset in virtual archive
+    u32 data_len;            // actual bytes sent (compressed if compress_flag=1)
+    u32 raw_len;             // original uncompressed size
+    u32 xxh3_32;             // hash of raw (uncompressed) data
+    u8  compress_flag;       // 0=none, 1=zstd
+    u8  pad[3];
+};
+static_assert(sizeof(ArchiveChunkHdr) == 28, "ArchiveChunkHdr size mismatch");
 
 #pragma pack(pop)
 

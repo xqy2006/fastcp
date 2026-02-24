@@ -1,6 +1,7 @@
 set(CLIENT_SOURCES
     session_manager.cpp
     file_receiver.cpp
+    archive_receiver.cpp
     connection_handler.cpp
     client_app.cpp
     main.cpp

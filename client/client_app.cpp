@@ -112,7 +112,7 @@ int ClientApp::run() {
     // session_id=0 (new session) and tells server our desired num_connections.
     // Server responds with HANDSHAKE_ACK containing the session_id and
     // accepted_conns. Subsequent connections carry that session_id.
-    u16 caps = CAP_RESUME | CAP_BUNDLE | CAP_COMPRESS | CAP_DELTA;
+    u16 caps = CAP_RESUME | CAP_BUNDLE | CAP_COMPRESS | CAP_DELTA | CAP_VIRTUAL_ARCHIVE;
 
     HandshakeReq req0{};
     handshake_req_init(req0,

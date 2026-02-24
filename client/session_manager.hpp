@@ -56,6 +56,12 @@ struct SessionInfo {
     std::shared_ptr<void> shared_receiver;
     std::mutex receiver_mutex;
 
+    // Shared ArchiveReceiver for all connections in archive mode
+    std::shared_ptr<void> shared_archive_receiver;
+    std::mutex archive_receiver_mutex;
+    std::condition_variable archive_receiver_cv;
+    std::atomic<int> archive_done_count{0};
+
     // Stats
     std::atomic<u64> bytes_received{0};
     std::atomic<u32> files_done{0};

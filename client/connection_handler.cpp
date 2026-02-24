@@ -8,6 +8,7 @@
 #include "../common/utils.hpp"
 #include "../common/file_io.hpp"
 #include "../common/hash.hpp"
+#include "../common/compress.hpp"
 #include <cstring>
 #include <vector>
 #include <filesystem>
@@ -384,15 +385,30 @@ bool ConnectionHandler::build_and_send_sync_plan() {
 // ---- TRANSFER LOOP ----
 
 bool ConnectionHandler::handle_transfer_loop() {
-    // All connections share the same FileReceiver stored in the session
+    // Setup standard file receiver (shared across all connections)
     {
         std::lock_guard<std::mutex> lk(session_->receiver_mutex);
         if (!session_->shared_receiver) {
-            // First connection to reach transfer phase creates it
             auto r = std::make_shared<FileReceiver>(session_);
             session_->shared_receiver = r;
         }
         receiver_ = std::static_pointer_cast<FileReceiver>(session_->shared_receiver);
+    }
+
+    bool archive_mode = (session_->capabilities & CAP_VIRTUAL_ARCHIVE) != 0;
+
+    // Secondary connections in archive mode wait until conn[0] has set up the receiver
+    if (archive_mode && conn_index_ != 0) {
+        std::unique_lock<std::mutex> lk(session_->archive_receiver_mutex);
+        session_->archive_receiver_cv.wait_for(lk, std::chrono::seconds(60),
+            [this]{ return session_->shared_archive_receiver != nullptr; });
+        if (!session_->shared_archive_receiver) {
+            LOG_ERROR("conn[" + std::to_string(conn_index_) +
+                      "]: timeout waiting for archive receiver");
+            return false;
+        }
+        archive_receiver_ = std::static_pointer_cast<ArchiveReceiver>(
+            session_->shared_archive_receiver);
     }
 
     FrameHeader hdr{};
@@ -423,7 +439,7 @@ bool ConnectionHandler::handle_transfer_loop() {
                 break;
             case MsgType::MT_BUNDLE_BEGIN:
                 if (!on_bundle_begin(payload)) return false;
-                bundle_files_left = 0; // reset; on_bundle_begin reads count
+                bundle_files_left = 0;
                 break;
             case MsgType::MT_BUNDLE_ENTRY:
                 if (!on_bundle_entry(payload, bundle_files_left)) {
@@ -431,7 +447,23 @@ bool ConnectionHandler::handle_transfer_loop() {
                 }
                 break;
             case MsgType::MT_BUNDLE_END:
-                // Nothing to do
+                break;
+            case MsgType::MT_ARCHIVE_MANIFEST_HDR:
+                if (!on_archive_manifest_hdr(payload)) return false;
+                break;
+            case MsgType::MT_ARCHIVE_FILE_ENTRY:
+                if (!on_archive_file_entry(payload)) return false;
+                break;
+            case MsgType::MT_ARCHIVE_MANIFEST_END:
+                if (!on_archive_manifest_end()) return false;
+                break;
+            case MsgType::MT_ARCHIVE_CHUNK:
+                if (!on_archive_chunk(payload)) {
+                    // Log but continue
+                }
+                break;
+            case MsgType::MT_ARCHIVE_DONE:
+                on_archive_done();
                 break;
             case MsgType::MT_SESSION_DONE:
                 return on_session_done();
@@ -574,4 +606,144 @@ void ConnectionHandler::send_nack(u32 ref_id, u16 ref_type, u16 chunk_index, u32
 
 void ConnectionHandler::send_error(const std::string& msg) {
     sock_.write_frame(MsgType::MT_ERROR_MSG, 0, msg.data(), (u32)msg.size());
+}
+
+// ---- ARCHIVE MESSAGE HANDLERS ----
+
+bool ConnectionHandler::on_archive_manifest_hdr(const std::vector<u8>& payload) {
+    if (payload.size() < sizeof(ArchiveManifestHdr)) return false;
+    std::memcpy(&pending_manifest_hdr_, payload.data(), sizeof(ArchiveManifestHdr));
+    proto::decode_archive_manifest_hdr(pending_manifest_hdr_);
+    pending_archive_slots_.clear();
+    pending_archive_slots_.reserve(pending_manifest_hdr_.total_files);
+    LOG_DEBUG("ARCHIVE_MANIFEST_HDR: files=" +
+              std::to_string(pending_manifest_hdr_.total_files) +
+              " chunks=" + std::to_string(pending_manifest_hdr_.total_chunks));
+    return true;
+}
+
+bool ConnectionHandler::on_archive_file_entry(const std::vector<u8>& payload) {
+    if (payload.size() < sizeof(ArchiveFileEntry)) return false;
+    ArchiveFileEntry fe{};
+    std::memcpy(&fe, payload.data(), sizeof(ArchiveFileEntry));
+    proto::decode_archive_file_entry(fe);
+
+    size_t path_off = sizeof(ArchiveFileEntry);
+    if (payload.size() < path_off + fe.path_len) {
+        LOG_WARN("Short ARCHIVE_FILE_ENTRY payload");
+        return false;
+    }
+    std::string rel_path((char*)(payload.data() + path_off), fe.path_len);
+
+    fs::path abs_path;
+    try {
+        abs_path = file_io::proto_to_fspath(session_->root_dir, rel_path);
+    } catch (const std::exception& e) {
+        LOG_WARN("archive_file_entry: bad path " + rel_path + ": " + e.what());
+        return false;
+    }
+
+    ArchiveFileSlot slot;
+    slot.file_id        = fe.file_id;
+    slot.virtual_offset = fe.virtual_offset;
+    slot.file_size      = fe.file_size;
+    slot.mtime_ns       = fe.mtime_ns;
+    slot.abs_path       = abs_path.string();
+    std::memcpy(slot.expected_hash, fe.xxh3_128, 16);
+
+    pending_archive_slots_.push_back(std::move(slot));
+    return true;
+}
+
+bool ConnectionHandler::on_archive_manifest_end() {
+    // Only conn[0] processes the manifest and sends CHUNK_REQUEST
+    if (conn_index_ != 0) return true;
+
+    // Create shared archive receiver
+    auto ar = std::make_shared<ArchiveReceiver>(session_);
+    ar->init(std::move(pending_archive_slots_),
+             pending_manifest_hdr_.chunk_size,
+             pending_manifest_hdr_.total_virtual_size);
+    pending_archive_slots_.clear();
+
+    // Preallocate all target files
+    ar->preallocate_all();
+
+    // Store in session and signal secondary connections
+    {
+        std::lock_guard<std::mutex> lk(session_->archive_receiver_mutex);
+        session_->shared_archive_receiver = ar;
+    }
+    session_->archive_receiver_cv.notify_all();
+    archive_receiver_ = ar;
+
+    // Build and send CHUNK_REQUEST
+    std::vector<u32> needed = ar->build_needed_chunks();
+
+    ChunkRequestHdr req_hdr{};
+    req_hdr.needed_count = (u32)needed.size();
+
+    std::vector<u8> payload(sizeof(ChunkRequestHdr) + needed.size() * sizeof(u32));
+    ChunkRequestHdr encoded_hdr = req_hdr;
+    proto::encode_chunk_request_hdr(encoded_hdr);
+    std::memcpy(payload.data(), &encoded_hdr, sizeof(ChunkRequestHdr));
+
+    u8* id_ptr = payload.data() + sizeof(ChunkRequestHdr);
+    for (size_t i = 0; i < needed.size(); ++i) {
+        u32 cid = proto::hton32(needed[i]);
+        std::memcpy(id_ptr + i * sizeof(u32), &cid, sizeof(u32));
+    }
+
+    sock_.write_frame(MsgType::MT_CHUNK_REQUEST, 0,
+                      payload.data(), (u32)payload.size());
+
+    LOG_INFO("CHUNK_REQUEST sent: " + std::to_string(needed.size()) + " chunks");
+    return true;
+}
+
+bool ConnectionHandler::on_archive_chunk(const std::vector<u8>& payload) {
+    if (!archive_receiver_) {
+        // Might arrive before archive_receiver is set on conn[0] (shouldn't happen)
+        LOG_WARN("on_archive_chunk: archive_receiver not ready (conn " +
+                 std::to_string(conn_index_) + ")");
+        return false;
+    }
+    if (payload.size() < sizeof(ArchiveChunkHdr)) return false;
+
+    ArchiveChunkHdr hdr{};
+    std::memcpy(&hdr, payload.data(), sizeof(ArchiveChunkHdr));
+    proto::decode_archive_chunk_hdr(hdr);
+
+    const u8* data_ptr = payload.data() + sizeof(ArchiveChunkHdr);
+    u32       data_len = hdr.data_len;
+
+    // Decompress if needed
+    std::vector<u8> decomp_buf;
+    if (hdr.compress_flag == 1 && hdr.raw_len > 0) {
+        try {
+            decomp_buf = compress::decompress_to_vec(data_ptr, data_len, hdr.raw_len);
+            data_ptr = decomp_buf.data();
+            data_len = hdr.raw_len;
+        } catch (const std::exception& e) {
+            LOG_WARN("on_archive_chunk: decompress failed for chunk " +
+                     std::to_string(hdr.chunk_id) + ": " + e.what());
+            return false;
+        }
+    }
+
+    // Adjust hdr.data_len to raw_len so receiver sees the raw size
+    ArchiveChunkHdr raw_hdr = hdr;
+    raw_hdr.data_len = data_len;
+
+    archive_receiver_->on_archive_chunk(raw_hdr, data_ptr);
+    return true;
+}
+
+bool ConnectionHandler::on_archive_done() {
+    int count = session_->archive_done_count.fetch_add(1) + 1;
+    LOG_DEBUG("ARCHIVE_DONE received on conn " + std::to_string(conn_index_) +
+              " (" + std::to_string(count) + "/" +
+              std::to_string(session_->total_conns) + ")");
+    // Session completion is handled by the subsequent MT_SESSION_DONE
+    return true;
 }

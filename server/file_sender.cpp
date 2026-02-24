@@ -435,6 +435,90 @@ void FileSender::init_file_tracking(u32 file_id, int num_threads) {
     file_success_[file_id] = true;
 }
 
+// ---- Virtual Archive send ----
+
+bool FileSender::send_archive_range(const ArchiveBuilder& archive,
+                                     const std::vector<u32>& chunk_ids,
+                                     int conn_idx)
+{
+    for (u32 chunk_id : chunk_ids) {
+        if (chunk_id >= (u32)archive.chunks().size()) {
+            LOG_WARN("send_archive_range: invalid chunk_id " + std::to_string(chunk_id));
+            continue;
+        }
+        const VirtualChunk& vc = archive.chunks()[chunk_id];
+
+        // Read raw chunk data (may span multiple files)
+        std::vector<u8> raw_data;
+        try {
+            raw_data = archive.read_chunk(chunk_id);
+        } catch (const std::exception& e) {
+            LOG_WARN("send_archive_range: read_chunk " + std::to_string(chunk_id) +
+                     " failed: " + e.what());
+            return false;
+        }
+
+        // Optionally compress
+        std::vector<u8> comp_buf;
+        const u8* send_data   = raw_data.data();
+        u32       send_len    = vc.raw_size;
+        u8        comp_flag   = 0;
+
+        if (use_compress_ && !raw_data.empty()) {
+            comp_buf = compress::compress_to_vec(raw_data.data(), raw_data.size());
+            if (comp_buf.size() < raw_data.size()) {
+                send_data = comp_buf.data();
+                send_len  = (u32)comp_buf.size();
+                comp_flag = 1;
+            }
+        }
+
+        // Compute xxh3_32 of raw data
+        u32 xxh = raw_data.empty() ? 0 : hash::xxh3_32(raw_data.data(), raw_data.size());
+
+        // Build header
+        ArchiveChunkHdr hdr{};
+        hdr.chunk_id       = chunk_id;
+        hdr.archive_offset = vc.archive_offset;
+        hdr.data_len       = send_len;
+        hdr.raw_len        = vc.raw_size;
+        hdr.xxh3_32        = xxh;
+        hdr.compress_flag  = comp_flag;
+
+        // Build payload = header + data
+        std::vector<u8> payload(sizeof(ArchiveChunkHdr) + send_len);
+        ArchiveChunkHdr encoded = hdr;
+        proto::encode_archive_chunk_hdr(encoded);
+        std::memcpy(payload.data(), &encoded, sizeof(ArchiveChunkHdr));
+        if (send_len > 0) {
+            std::memcpy(payload.data() + sizeof(ArchiveChunkHdr), send_data, send_len);
+        }
+
+        try {
+            auto g = pool_.guard(conn_idx);
+            g.socket().write_frame(MsgType::MT_ARCHIVE_CHUNK, 0,
+                                   payload.data(), (u32)payload.size());
+        } catch (const std::exception& e) {
+            LOG_WARN("send_archive_range: write chunk " + std::to_string(chunk_id) +
+                     " failed: " + e.what());
+            return false;
+        }
+
+        tui_state_.bytes_sent.fetch_add(vc.raw_size);
+    }
+
+    // Signal end of this connection's archive range
+    try {
+        auto g = pool_.guard(conn_idx);
+        g.socket().write_frame(MsgType::MT_ARCHIVE_DONE, 0, nullptr, 0);
+    } catch (const std::exception& e) {
+        LOG_WARN("send_archive_range: ARCHIVE_DONE failed: " + std::string(e.what()));
+        return false;
+    }
+
+    return true;
+}
+
 // ---- ACK/NACK handling ----
 
 bool FileSender::on_ack(const Ack& ack) {

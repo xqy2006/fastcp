@@ -3,6 +3,7 @@
 // ============================================================
 
 #include "server_app.hpp"
+#include "archive_builder.hpp"
 #include "../common/protocol_io.hpp"
 #include "../common/logger.hpp"
 #include "../common/utils.hpp"
@@ -168,7 +169,7 @@ void ServerApp::connector_thread(TcpSocket sock) {
             // negotiate capabilities, send ACK immediately.
             sid = generate_session_id();
 
-            u16 server_caps = CAP_COMPRESS | CAP_RESUME | CAP_BUNDLE | CAP_DELTA;
+        u16 server_caps = CAP_COMPRESS | CAP_RESUME | CAP_BUNDLE | CAP_DELTA | CAP_VIRTUAL_ARCHIVE;
             if (!config_.use_compress) server_caps &= ~CAP_COMPRESS;
             agreed_caps       = req.capabilities & server_caps;
             agreed_chunk_size = config_.chunk_size;
@@ -399,8 +400,14 @@ int ClientSession::run() {
         return 1;
     }
 
-    if (!phase_transfer(plan)) {
-        LOG_WARN("Transfer completed with some errors");
+    if (agreed_caps_ & CAP_VIRTUAL_ARCHIVE) {
+        if (!phase_transfer_archive(plan)) {
+            LOG_WARN("Archive transfer completed with some errors");
+        }
+    } else {
+        if (!phase_transfer(plan)) {
+            LOG_WARN("Transfer completed with some errors");
+        }
     }
 
     phase_done();
@@ -756,7 +763,139 @@ bool ClientSession::phase_transfer(const SyncPlanMap& plan) {
     return all_ok;
 }
 
-// ---- Phase 4: SESSION_DONE ----
+// ---- Phase 3b: Archive Transfer ----
+
+bool ClientSession::phase_transfer_archive(const SyncPlanMap& plan) {
+    // 1. Filter out SKIP files; build the file list to archive
+    std::vector<FileEntry> to_send;
+    for (auto& fe : entries_) {
+        auto it = plan.plan.find(fe.file_id);
+        if (it != plan.plan.end() && it->second.first == SyncAction::SKIP) {
+            continue;
+        }
+        to_send.push_back(fe);
+    }
+
+    // 2. Build virtual archive layout
+    ArchiveBuilder archive;
+    archive.build(to_send, agreed_chunk_size_);
+
+    LOG_INFO("Archive mode: " + std::to_string(archive.files().size()) +
+             " files, " + std::to_string(archive.chunks().size()) + " chunks");
+
+    TcpSocket& sock0 = pool_.get(0);
+
+    // 3. Send manifest on conn[0]
+    {
+        ArchiveManifestHdr hdr_msg{};
+        hdr_msg.total_virtual_size = archive.total_size();
+        hdr_msg.total_files        = (u32)archive.files().size();
+        hdr_msg.chunk_size         = archive.chunk_size();
+        hdr_msg.total_chunks       = (u32)archive.chunks().size();
+        ArchiveManifestHdr encoded = hdr_msg;
+        proto::encode_archive_manifest_hdr(encoded);
+        sock0.write_frame(MsgType::MT_ARCHIVE_MANIFEST_HDR, 0,
+                          &encoded, sizeof(encoded));
+    }
+
+    for (const auto& vf : archive.files()) {
+        std::vector<u8> payload(sizeof(ArchiveFileEntry) + vf.rel_path.size());
+        ArchiveFileEntry fe_msg{};
+        fe_msg.file_id        = vf.file_id;
+        fe_msg.virtual_offset = vf.virtual_offset;
+        fe_msg.file_size      = vf.file_size;
+        fe_msg.mtime_ns       = vf.mtime_ns;
+        fe_msg.path_len       = (u16)vf.rel_path.size();
+        fe_msg.flags          = 0;
+        hash::to_bytes(vf.xxh3_128, fe_msg.xxh3_128);
+
+        ArchiveFileEntry encoded = fe_msg;
+        proto::encode_archive_file_entry(encoded);
+        std::memcpy(payload.data(), &encoded, sizeof(ArchiveFileEntry));
+        std::memcpy(payload.data() + sizeof(ArchiveFileEntry),
+                    vf.rel_path.data(), vf.rel_path.size());
+
+        sock0.write_frame(MsgType::MT_ARCHIVE_FILE_ENTRY, 0,
+                          payload.data(), (u32)payload.size());
+    }
+
+    sock0.write_frame(MsgType::MT_ARCHIVE_MANIFEST_END, 0, nullptr, 0);
+
+    // 4. Receive CHUNK_REQUEST from client (conn[0])
+    FrameHeader req_hdr{};
+    std::vector<u8> req_payload;
+    if (!sock0.read_frame(req_hdr, req_payload)) {
+        LOG_ERROR("phase_transfer_archive: connection closed waiting for CHUNK_REQUEST");
+        return false;
+    }
+    if ((MsgType)req_hdr.msg_type != MsgType::MT_CHUNK_REQUEST) {
+        LOG_ERROR("phase_transfer_archive: expected MT_CHUNK_REQUEST, got " +
+                  std::to_string(req_hdr.msg_type));
+        return false;
+    }
+
+    std::vector<u32> needed_chunks;
+    if (req_payload.size() >= sizeof(ChunkRequestHdr)) {
+        ChunkRequestHdr creq{};
+        std::memcpy(&creq, req_payload.data(), sizeof(ChunkRequestHdr));
+        proto::decode_chunk_request_hdr(creq);
+        u32 cnt = creq.needed_count;
+
+        size_t expected_size = sizeof(ChunkRequestHdr) + (size_t)cnt * sizeof(u32);
+        if (req_payload.size() >= expected_size) {
+            needed_chunks.reserve(cnt);
+            const u8* id_ptr = req_payload.data() + sizeof(ChunkRequestHdr);
+            for (u32 i = 0; i < cnt; ++i) {
+                u32 cid;
+                std::memcpy(&cid, id_ptr + i * sizeof(u32), sizeof(u32));
+                needed_chunks.push_back(proto::ntoh32(cid));
+            }
+        }
+    }
+
+    LOG_INFO("CHUNK_REQUEST: " + std::to_string(needed_chunks.size()) +
+             " chunks requested");
+
+    // If no chunks needed, send ARCHIVE_DONE immediately on all connections
+    if (needed_chunks.empty()) {
+        int num_conns = pool_.size();
+        for (int ci = 0; ci < num_conns; ++ci) {
+            pool_.get(ci).write_frame(MsgType::MT_ARCHIVE_DONE, 0, nullptr, 0);
+        }
+        return true;
+    }
+
+    // 5. Distribute chunks round-robin across connections
+    int num_conns = pool_.size();
+    std::vector<std::vector<u32>> conn_chunks((size_t)num_conns);
+    for (size_t i = 0; i < needed_chunks.size(); ++i) {
+        conn_chunks[i % (size_t)num_conns].push_back(needed_chunks[i]);
+    }
+
+    // 6. Parallel send (one thread per connection)
+    FileSender sender(pool_, tui_state_, cfg_.use_compress, agreed_chunk_size_,
+                      delta_checksums_, delta_block_sizes_);
+    std::vector<std::thread> threads;
+    std::atomic<bool> any_failed{false};
+
+    for (int ci = 0; ci < num_conns; ++ci) {
+        threads.emplace_back([&, ci]() {
+            if (!sender.send_archive_range(archive, conn_chunks[(size_t)ci], ci)) {
+                any_failed.store(true);
+            }
+        });
+    }
+    for (auto& t : threads) {
+        if (t.joinable()) t.join();
+    }
+
+    // Update TUI: count files sent
+    tui_state_.files_done.fetch_add((u32)archive.files().size());
+
+    return !any_failed.load();
+}
+
+
 
 bool ClientSession::phase_done() {
     bool all_ok = true;

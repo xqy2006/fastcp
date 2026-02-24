@@ -21,6 +21,7 @@
 #include "dir_scanner.hpp"
 #include "connection_pool.hpp"
 #include "file_sender.hpp"
+#include "archive_builder.hpp"
 #include "tui.hpp"
 #include <string>
 #include <vector>
@@ -106,6 +107,7 @@ private:
 
     bool phase_file_list(SyncPlanMap& plan_out);
     bool phase_transfer(const SyncPlanMap& plan);
+    bool phase_transfer_archive(const SyncPlanMap& plan);
     bool phase_done();
 };
 

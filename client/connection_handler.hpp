@@ -9,8 +9,10 @@
 #include "../common/protocol.hpp"
 #include "session_manager.hpp"
 #include "file_receiver.hpp"
+#include "archive_receiver.hpp"
 #include <memory>
 #include <string>
+#include <vector>
 
 enum class HandlerState {
     HANDSHAKE,
@@ -44,8 +46,13 @@ private:
     bool                skip_handshake_{false};
     HandlerState        state_{HandlerState::HANDSHAKE};
 
-    std::shared_ptr<SessionInfo>  session_;
-    std::shared_ptr<FileReceiver> receiver_;
+    std::shared_ptr<SessionInfo>   session_;
+    std::shared_ptr<FileReceiver>  receiver_;
+    std::shared_ptr<ArchiveReceiver> archive_receiver_;
+
+    // Temporary accumulation of archive manifest entries (conn[0] only)
+    ArchiveManifestHdr            pending_manifest_hdr_{};
+    std::vector<ArchiveFileSlot>  pending_archive_slots_;
 
     // ---- State handlers ----
     bool handle_handshake();
@@ -60,6 +67,13 @@ private:
     bool on_bundle_begin(const std::vector<u8>& payload);
     bool on_bundle_entry(const std::vector<u8>& payload, u32& bundle_files_left);
     bool on_session_done();
+
+    // ---- Archive message handlers ----
+    bool on_archive_manifest_hdr(const std::vector<u8>& payload);
+    bool on_archive_file_entry(const std::vector<u8>& payload);
+    bool on_archive_manifest_end();
+    bool on_archive_chunk(const std::vector<u8>& payload);
+    bool on_archive_done();
 
     void send_ack(u32 ref_id, u16 ref_type, u16 chunk_index, u32 status = 0);
     void send_nack(u32 ref_id, u16 ref_type, u16 chunk_index, u32 error_code);
