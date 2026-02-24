@@ -11,9 +11,13 @@ static constexpr u8  FASTCP_VERSION = 1;
 
 static constexpr u32 MAX_PAYLOAD_LEN   = 64u * 1024u * 1024u;
 static constexpr u32 DEFAULT_CHUNK_SIZE = 1u * 1024u * 1024u;
-static constexpr u64 BUNDLE_THRESHOLD  = 64u * 1024u;
-static constexpr u32 MAX_BUNDLE_SIZE   = 4u * 1024u * 1024u;
-static constexpr u32 MAX_BUNDLE_FILES  = 256u;
+// Files up to BUNDLE_THRESHOLD are sent in bundles (no per-file protocol overhead).
+// 4 MB: covers most locale packs, small DLLs, config files.
+static constexpr u64 BUNDLE_THRESHOLD  = 4u * 1024u * 1024u;
+// Max total size per bundle message (32 MB keeps payload well under MAX_PAYLOAD_LEN).
+static constexpr u32 MAX_BUNDLE_SIZE   = 32u * 1024u * 1024u;
+// Effectively unlimited file count per bundle (memory is the real limit via MAX_BUNDLE_SIZE).
+static constexpr u32 MAX_BUNDLE_FILES  = 65536u;
 
 // ---- Message Types (all prefixed MT_ to avoid Windows macro collisions) ----
 enum class MsgType : u16 {

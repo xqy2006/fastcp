@@ -1,6 +1,7 @@
 set(COMMON_SOURCES
     socket.cpp
     file_io.cpp
+    tui.cpp
 )
 
 add_library(fastcp_common STATIC ${COMMON_SOURCES})

@@ -99,9 +99,11 @@ bool FileSender::send_large_file(const FileEntry& fe, u64 resume_offset, int con
         }
 
         // Use the assigned connection (meta_conn) for all chunks
-        auto g = pool_.guard(meta_conn);
-        bool ok = send_chunk(g.socket(), fe, ci, offset, data_ptr, raw_len, do_compress);
-        g.~Guard();  // Release lock before retry
+        bool ok = false;
+        {
+            auto g = pool_.guard(meta_conn);
+            ok = send_chunk(g.socket(), fe, ci, offset, data_ptr, raw_len, do_compress);
+        }
 
         if (!ok) {
             bool success = false;
@@ -181,16 +183,7 @@ bool FileSender::send_large_file_parallel(
     // Calculate chunks
     u32 total_chunks = (u32)((fe.file_size + chunk_size_ - 1) / chunk_size_);
 
-    // Initialize per-file tracking (only thread 0, before any other work)
-    if (thread_idx == 0) {
-        std::lock_guard<std::mutex> lk(file_completion_mutex_);
-        file_threads_pending_[fe.file_id] = num_threads_for_file;
-        file_success_[fe.file_id] = true;
-    }
-
-    // Small delay to ensure thread 0's initialization is visible
-    // (This is a simple barrier; could use std::barrier in C++20)
-    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    // (file tracking is initialized by init_file_tracking() before threads are spawned)
 
     // Each thread sends FileMeta on its own connection (client ignores duplicates)
     {
@@ -235,9 +228,11 @@ bool FileSender::send_large_file_parallel(
         }
 
         // Send chunk on this thread's dedicated connection
-        auto g = pool_.guard(my_conn);
-        bool ok = send_chunk(g.socket(), fe, ci, offset, data_ptr, raw_len, do_compress);
-        g.~Guard();
+        bool ok = false;
+        {
+            auto g = pool_.guard(my_conn);
+            ok = send_chunk(g.socket(), fe, ci, offset, data_ptr, raw_len, do_compress);
+        }
 
         if (!ok) {
             bool success = false;
@@ -260,41 +255,43 @@ bool FileSender::send_large_file_parallel(
                   utils::format_bytes(delta_bytes_skipped) + " of " + fe.rel_path);
     }
 
-    // Coordinate: wait for all threads to finish their chunks
-    // Last thread sends FILE_END
+    // Coordinate: last thread sends FILE_END.
+    // IMPORTANT: Release file_completion_mutex_ BEFORE acquiring pool guard to avoid deadlock.
+    // (Lock order inversion: another thread may hold pool guard while waiting for completion mutex)
+    bool is_last = false;
     {
         std::lock_guard<std::mutex> lk(file_completion_mutex_);
         if (!thread_ok) {
             file_success_[fe.file_id] = false;
         }
-        int remaining = --file_threads_pending_[fe.file_id];
-
-        if (remaining == 0) {
-            // Last thread: send FILE_END on connection 0
-            int end_conn = conn_indices[0];
-
-            FileEnd end_msg{};
-            end_msg.file_id    = fe.file_id;
-            end_msg.total_size = fe.file_size;
-            hash::to_bytes(fe.xxh3_128, end_msg.xxh3_128);
-
-            FileEnd encoded = end_msg;
-            proto::encode_file_end(encoded);
-
-            {
-                auto g = pool_.guard(end_conn);
-                g.socket().write_frame(MsgType::MT_FILE_END, 0, &encoded, sizeof(encoded));
-            }
-
-            // Cleanup
+        is_last = (--file_threads_pending_[fe.file_id] == 0);
+        if (is_last) {
+            // Cleanup map entries while holding the lock
             file_threads_pending_.erase(fe.file_id);
             file_success_.erase(fe.file_id);
             file_chunks_pending_.erase(fe.file_id);
+        }
+    }
+    // file_completion_mutex_ released here — safe to acquire pool guard now
 
-            // Callback
-            if (on_done) {
-                on_done(fe.file_id);
-            }
+    if (is_last) {
+        int end_conn = conn_indices[0];
+
+        FileEnd end_msg{};
+        end_msg.file_id    = fe.file_id;
+        end_msg.total_size = fe.file_size;
+        hash::to_bytes(fe.xxh3_128, end_msg.xxh3_128);
+
+        FileEnd encoded = end_msg;
+        proto::encode_file_end(encoded);
+
+        {
+            auto g = pool_.guard(end_conn);
+            g.socket().write_frame(MsgType::MT_FILE_END, 0, &encoded, sizeof(encoded));
+        }
+
+        if (on_done) {
+            on_done(fe.file_id);
         }
     }
 
@@ -428,6 +425,14 @@ bool FileSender::block_matches_client(u32 file_id, u32 block_index,
         }
     }
     return false;
+}
+
+// ---- Per-file tracking initialization ----
+
+void FileSender::init_file_tracking(u32 file_id, int num_threads) {
+    std::lock_guard<std::mutex> lk(file_completion_mutex_);
+    file_threads_pending_[file_id] = num_threads;
+    file_success_[file_id] = true;
 }
 
 // ---- ACK/NACK handling ----

@@ -88,6 +88,10 @@ public:
 
     bool flush_acks();
 
+    // Initialize per-file parallel tracking.
+    // MUST be called from the spawning thread BEFORE any worker threads start.
+    void init_file_tracking(u32 file_id, int num_threads);
+
 private:
     ConnectionPool& pool_;
     TuiState&       tui_state_;
@@ -102,9 +106,9 @@ private:
 
     // For parallel file sending: track completion status
     std::mutex file_completion_mutex_;
-    std::unordered_map<u32, std::atomic<int>> file_chunks_pending_;  // file_id -> remaining chunks
-    std::unordered_map<u32, std::atomic<int>> file_threads_pending_; // file_id -> remaining threads
-    std::unordered_map<u32, bool> file_success_;                     // file_id -> success status
+    std::unordered_map<u32, int>  file_chunks_pending_;   // file_id -> remaining chunks  (protected by file_completion_mutex_)
+    std::unordered_map<u32, int>  file_threads_pending_;  // file_id -> remaining threads (protected by file_completion_mutex_)
+    std::unordered_map<u32, bool> file_success_;          // file_id -> success status     (protected by file_completion_mutex_)
 
     // Synchronization: wait for FileMeta before sending chunks
     std::mutex file_meta_mutex_;

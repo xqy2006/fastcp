@@ -7,6 +7,7 @@
 #include "../common/logger.hpp"
 #include "../common/utils.hpp"
 #include "../common/protocol_io.hpp"
+#include "../common/tui.hpp"
 #include <filesystem>
 #include <stdexcept>
 #include <thread>
@@ -200,6 +201,40 @@ int ClientApp::run() {
     // --- Step 7: run ConnectionHandlers ---
     // Use skip_handshake=true since we already did the handshake above.
 
+    // Setup client-side TUI progress bar
+    TuiState tui_state;
+    tui_state.transfer_label = "Recv";
+    auto tui = std::make_unique<Tui>(tui_state);
+
+    // Bridge thread: periodically copies session stats -> TUI state.
+    // Waits for file list to be ready before computing bytes_total.
+    std::atomic<bool> bridge_stop{false};
+    std::thread bridge([&]() {
+        // Wait until conn[0] has received the full file list
+        {
+            std::unique_lock<std::mutex> lk(session->file_list_mutex);
+            session->file_list_cv.wait_for(lk, std::chrono::seconds(60),
+                [&] { return session->file_list_ready; });
+        }
+
+        // Compute total bytes from file list
+        u64 bytes_total = 0;
+        for (auto& f : session->file_list) bytes_total += f.file_size;
+        tui_state.bytes_total.store(bytes_total);
+        tui_state.files_total.store(session->files_total.load());
+
+        while (!bridge_stop.load()) {
+            tui_state.bytes_sent.store(session->bytes_received.load());
+            tui_state.files_done.store(session->files_done.load());
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        // Final update
+        tui_state.bytes_sent.store(session->bytes_received.load());
+        tui_state.files_done.store(session->files_done.load());
+    });
+
+    tui->start();
+
     std::vector<std::thread> threads;
 
     // conn[0]: file_list + transfer
@@ -228,6 +263,15 @@ int ClientApp::run() {
     for (auto& t : threads) {
         if (t.joinable()) t.join();
     }
+
+    bridge_stop.store(true);
+    if (bridge.joinable()) bridge.join();
+    tui->stop();
+
+    u64 total_received = session->bytes_received.load();
+    std::cout << "Transfer complete: "
+              << utils::format_bytes(total_received)
+              << " in " << session->files_done.load() << " files\n";
 
     return session->done.load() ? 0 : 1;
 }

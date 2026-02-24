@@ -612,31 +612,52 @@ bool ClientSession::phase_transfer(const SyncPlanMap& plan) {
     int num_conns = pool_.size();
     bool all_ok = true;
 
-    // ---- Send small files as bundles (round-robin on connections) ----
-    {
-        std::vector<const FileEntry*> bundle;
-        u64 bundle_size = 0;
-        u32 bundle_conn = 0;
-
-        auto flush_bundle = [&]() {
-            if (bundle.empty()) return;
-            if (!sender.send_bundle(bundle, (int)bundle_conn)) {
-                all_ok = false;
-            }
-            tui_state_.files_done.fetch_add((u32)bundle.size());
-            bundle_conn = (bundle_conn + 1) % (u32)num_conns;
-            bundle.clear();
-            bundle_size = 0;
-        };
-
-        for (auto* fe : small_files) {
-            bundle.push_back(fe);
-            bundle_size += fe->file_size;
-            if (bundle.size() >= MAX_BUNDLE_FILES || bundle_size >= MAX_BUNDLE_SIZE) {
-                flush_bundle();
-            }
+    // ---- Send small files as bundles (parallel: each connection handles its own queue) ----
+    // Assign files to connections round-robin, then launch one thread per connection
+    // so all N connections send their bundle batches concurrently.
+    if (!small_files.empty()) {
+        // Partition files across connections
+        std::vector<std::vector<const FileEntry*>> conn_files(num_conns);
+        for (size_t i = 0; i < small_files.size(); ++i) {
+            conn_files[i % (size_t)num_conns].push_back(small_files[i]);
         }
-        flush_bundle();
+
+        std::vector<std::thread> bundle_threads;
+        std::atomic<bool> any_failed{false};
+
+        for (int ci = 0; ci < num_conns; ++ci) {
+            if (conn_files[ci].empty()) continue;
+            bundle_threads.emplace_back([&, ci]() {
+                auto& files = conn_files[ci];
+                std::vector<const FileEntry*> batch;
+                u64 batch_size = 0;
+
+                auto flush = [&]() {
+                    if (batch.empty()) return;
+                    if (!sender.send_bundle(batch, ci)) {
+                        any_failed.store(true);
+                    }
+                    tui_state_.files_done.fetch_add((u32)batch.size());
+                    batch.clear();
+                    batch_size = 0;
+                };
+
+                for (auto* fe : files) {
+                    batch.push_back(fe);
+                    batch_size += fe->file_size;
+                    if (batch.size() >= MAX_BUNDLE_FILES || batch_size >= MAX_BUNDLE_SIZE) {
+                        flush();
+                    }
+                }
+                flush();
+            });
+        }
+
+        for (auto& t : bundle_threads) {
+            if (t.joinable()) t.join();
+        }
+
+        if (any_failed.load()) all_ok = false;
     }
 
     // ---- Send large files in parallel ----
@@ -666,6 +687,15 @@ bool ClientSession::phase_transfer(const SyncPlanMap& plan) {
                 for (int c = 0; c < conns_per_file && conn_idx < num_conns; ++c) {
                     file_conns[b].push_back(conn_idx++);
                 }
+            }
+
+            // Initialize per-file tracking BEFORE spawning threads to avoid race condition.
+            // (Previously done inside thread 0 with a 1ms sleep -- unreliable.)
+            for (int b = 0; b < current_batch; ++b) {
+                int fi = files_sent + b;
+                auto& [fe_ptr, ro] = large_files[fi];
+                int num_threads = (int)file_conns[b].size();
+                sender.init_file_tracking(fe_ptr->file_id, num_threads);
             }
 
             // Launch parallel transfers for this batch
@@ -734,13 +764,14 @@ bool ClientSession::phase_done() {
         try {
             TcpSocket& sock = pool_.get(i);
             sock.write_frame(MsgType::MT_SESSION_DONE, 0, nullptr, 0);
-            FrameHeader hdr{};
-            std::vector<u8> payload;
-            if (sock.read_frame(hdr, payload)) {
-                if ((MsgType)hdr.msg_type != MsgType::MT_SESSION_DONE) {
-                    LOG_WARN("Unexpected response to SESSION_DONE on conn " +
-                             std::to_string(i));
-                }
+            // Drain until SESSION_DONE ACK arrives (client may send ACKs for
+            // the final FILE_END before it processes our SESSION_DONE message).
+            for (int attempts = 0; attempts < 8; ++attempts) {
+                FrameHeader hdr{};
+                std::vector<u8> payload;
+                if (!sock.read_frame(hdr, payload)) break;
+                if ((MsgType)hdr.msg_type == MsgType::MT_SESSION_DONE) break;
+                // Any other message (e.g. FILE_END ACK) is silently discarded.
             }
         } catch (const std::exception& e) {
             LOG_WARN("phase_done conn " + std::to_string(i) + ": " + e.what());

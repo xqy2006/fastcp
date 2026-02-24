@@ -2,7 +2,6 @@ set(SERVER_SOURCES
     dir_scanner.cpp
     connection_pool.cpp
     file_sender.cpp
-    tui.cpp
     server_app.cpp
     main.cpp
 )

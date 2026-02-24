@@ -539,6 +539,12 @@ bool ConnectionHandler::on_session_done() {
         LOG_INFO("Session complete: files=" + std::to_string(session_->files_done.load()) +
                  " bytes=" + utils::format_bytes(session_->bytes_received.load()) +
                  " speed=" + utils::format_speed(speed));
+
+        // Clean up the transfer index: all files successfully received,
+        // no need to keep resume state.
+        if (session_->transfer_index) {
+            session_->transfer_index->destroy();
+        }
     }
 
     // Send final ACK

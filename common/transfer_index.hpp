@@ -47,6 +47,14 @@ public:
         save_locked();
     }
 
+    // Clear all entries and delete the index file from disk
+    void destroy() {
+        std::lock_guard<std::mutex> lk(mutex_);
+        index_.clear();
+        // Delete the file; ignore errors (file might not exist)
+        std::remove(path_.c_str());
+    }
+
     // Clear all entries
     void clear() {
         std::lock_guard<std::mutex> lk(mutex_);
