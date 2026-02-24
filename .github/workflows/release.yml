@@ -24,12 +24,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Clone third-party dependencies
-        shell: bash
-        run: |
-          git clone --depth=1 --branch v0.8.2 https://github.com/Cyan4973/xxHash.git third_party/xxhash
-          git clone --depth=1 --branch v1.5.5 https://github.com/facebook/zstd.git   third_party/zstd
-
       - name: Configure (Release, x64)
         shell: cmd
         run: cmake -B build -DCMAKE_BUILD_TYPE=Release -A x64
