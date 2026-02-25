@@ -828,6 +828,47 @@ bool ConnectionHandler::handle_pipeline_file_tree() {
 
     if (!cache_hit) {
         // ---- Read file list: compressed (CAP_COMPRESSED_TREE) or individual entries ----
+        // While receiving the file list over the network, scan the dst directory
+        // in a background thread to build a path→(size,mtime) map.
+        // This overlaps network I/O with disk I/O, matching rsync's pipeline approach.
+        struct DstInfo { u64 size; u64 mtime_ns; };
+        std::unordered_map<std::string, DstInfo> dst_map;
+
+        std::thread dst_scanner([&]() {
+            fs::path root(session_->root_dir);
+            std::error_code ec;
+            std::unordered_map<std::string, DstInfo> local_map;
+            local_map.reserve(4096);
+            for (auto& de : fs::recursive_directory_iterator(root,
+                    fs::directory_options::skip_permission_denied, ec)) {
+                if (!de.is_regular_file(ec)) continue;
+                fs::path rel = fs::relative(de.path(), root, ec);
+                if (ec) { ec.clear(); continue; }
+                if (!rel.empty() && rel.begin()->string() == ".fastcp") continue;
+                DstInfo di{};
+#ifdef _WIN32
+                WIN32_FILE_ATTRIBUTE_DATA info{};
+                if (GetFileAttributesExA(de.path().string().c_str(),
+                                         GetFileExInfoStandard, &info)) {
+                    di.size = ((u64)info.nFileSizeHigh << 32) | info.nFileSizeLow;
+                    u64 ft  = ((u64)info.ftLastWriteTime.dwHighDateTime << 32)
+                            | info.ftLastWriteTime.dwLowDateTime;
+                    di.mtime_ns = (ft >= 116444736000000000ULL)
+                                ? (ft - 116444736000000000ULL) * 100ULL : 0;
+                }
+#else
+                struct ::stat st{};
+                if (::stat(de.path().c_str(), &st) == 0) {
+                    di.size     = (u64)st.st_size;
+                    di.mtime_ns = (u64)st.st_mtim.tv_sec * 1000000000ULL
+                                + (u64)st.st_mtim.tv_nsec;
+                }
+#endif
+                local_map[rel.generic_string()] = di;
+            }
+            dst_map = std::move(local_map);
+        });
+
         bool use_compressed_tree = (session_->capabilities & CAP_COMPRESSED_TREE) != 0;
 
         if (use_compressed_tree) {
@@ -884,11 +925,67 @@ bool ConnectionHandler::handle_pipeline_file_tree() {
 
         LOG_INFO("Pipeline: file tree received (" +
                  std::to_string(session_->file_list.size()) + " files)");
+
+        // Wait for dst scan to finish (it ran in parallel with file list receive)
+        dst_scanner.join();
+
+        // ---- Step 2 (cache miss path): use dst_map for O(1) lookup ----
+        struct LocalInfo { u64 size; u64 mtime_ns; bool exists; };
+        std::vector<LocalInfo> local_info(session_->file_list.size());
+        for (size_t i = 0; i < session_->file_list.size(); ++i) {
+            auto it = dst_map.find(session_->file_list[i].rel_path);
+            if (it != dst_map.end())
+                local_info[i] = {it->second.size, it->second.mtime_ns, true};
+            else
+                local_info[i] = {0, 0, false};
+        }
+
+        // ---- Step 3: send WANT_FILE for files that need transfer ----
+        TcpWriteBuffer wbuf(sock_);
+        for (size_t i = 0; i < session_->file_list.size(); ++i) {
+            const auto& cfe = session_->file_list[i];
+            const auto& li  = local_info[i];
+            if (!li.exists || li.size != cfe.file_size) {
+                WantFileMsg wmsg{}; wmsg.file_id = cfe.file_id; wmsg.reason = 0;
+                WantFileMsg enc = wmsg; proto::encode_want_file_msg(enc);
+                wbuf.write_frame(MsgType::MT_WANT_FILE, 0, &enc, sizeof(enc));
+            } else if (li.mtime_ns == cfe.mtime_ns) {
+                session_->files_done.fetch_add(1);
+            } else {
+                bool has_server_hash = false;
+                for (int b = 0; b < 16; ++b)
+                    if (cfe.xxh3_128[b] != 0) { has_server_hash = true; break; }
+                bool content_ok = false;
+                if (has_server_hash) {
+                    try {
+                        fs::path abs_path = file_io::proto_to_fspath(
+                            session_->root_dir, cfe.rel_path);
+                        file_io::MmapReader reader(abs_path.string());
+                        if (reader.data()) {
+                            hash::Hash128 h = hash::xxh3_128(reader.data(), reader.size());
+                            content_ok = (std::memcmp(h.data(), cfe.xxh3_128, 16) == 0);
+                        }
+                    } catch (...) {}
+                }
+                if (content_ok) {
+                    session_->files_done.fetch_add(1);
+                } else {
+                    WantFileMsg wmsg{}; wmsg.file_id = cfe.file_id;
+                    wmsg.reason = has_server_hash ? u8(2) : u8(1);
+                    WantFileMsg enc = wmsg; proto::encode_want_file_msg(enc);
+                    wbuf.write_frame(MsgType::MT_WANT_FILE, 0, &enc, sizeof(enc));
+                }
+            }
+        }
+        wbuf.write_frame(MsgType::MT_FILE_CHECK_DONE, 0, nullptr, 0);
+        wbuf.flush();
+        LOG_INFO("Pipeline: FILE_CHECK_DONE sent");
+        return true;
     }
 
-    // ---- Step 2: Check each file, send WANT_FILE for any that need transfer ----
-    // Stat each file in the server's list in parallel (8 threads).
-    // On Windows NTFS this reduces 10k × ~300µs calls from ~3s to ~400ms.
+    // ---- Step 2 (cache hit path): stat each file in parallel (8 threads) ----
+    // File list came from local cache, no network wait to overlap with.
+    // On Windows NTFS 8 threads reduce 10k × ~300µs calls from ~3s to ~400ms.
     struct LocalInfo { u64 size; u64 mtime_ns; bool exists; };
     std::vector<LocalInfo> local_info(session_->file_list.size());
     {
@@ -940,7 +1037,6 @@ bool ConnectionHandler::handle_pipeline_file_tree() {
         const auto& li  = local_info[i];
 
         if (!li.exists || li.size != cfe.file_size) {
-            // File missing or size mismatch → request full transfer
             WantFileMsg wmsg{};
             wmsg.file_id = cfe.file_id;
             wmsg.reason  = 0;
@@ -948,15 +1044,11 @@ bool ConnectionHandler::handle_pipeline_file_tree() {
             proto::encode_want_file_msg(enc);
             wbuf.write_frame(MsgType::MT_WANT_FILE, 0, &enc, sizeof(enc));
         } else if (li.mtime_ns == cfe.mtime_ns) {
-            // Size + mtime match → skip
             session_->files_done.fetch_add(1);
         } else {
-            // mtime differs → check content hash if server provided one
             bool has_server_hash = false;
-            for (int b = 0; b < 16; ++b) {
+            for (int b = 0; b < 16; ++b)
                 if (cfe.xxh3_128[b] != 0) { has_server_hash = true; break; }
-            }
-
             bool content_ok = false;
             if (has_server_hash) {
                 try {
@@ -964,14 +1056,11 @@ bool ConnectionHandler::handle_pipeline_file_tree() {
                         session_->root_dir, cfe.rel_path);
                     file_io::MmapReader reader(abs_path.string());
                     if (reader.data()) {
-                        hash::Hash128 h =
-                            hash::xxh3_128(reader.data(), reader.size());
-                        content_ok =
-                            (std::memcmp(h.data(), cfe.xxh3_128, 16) == 0);
+                        hash::Hash128 h = hash::xxh3_128(reader.data(), reader.size());
+                        content_ok = (std::memcmp(h.data(), cfe.xxh3_128, 16) == 0);
                     }
                 } catch (...) {}
             }
-
             if (content_ok) {
                 session_->files_done.fetch_add(1);
             } else {
@@ -987,7 +1076,7 @@ bool ConnectionHandler::handle_pipeline_file_tree() {
 
     // ---- Step 3: Notify server that all files have been checked ----
     wbuf.write_frame(MsgType::MT_FILE_CHECK_DONE, 0, nullptr, 0);
-    wbuf.flush();  // send WANT_FILEs + FILE_CHECK_DONE in one batch
+    wbuf.flush();
     LOG_INFO("Pipeline: FILE_CHECK_DONE sent");
     return true;
 }
