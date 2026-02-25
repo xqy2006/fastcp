@@ -1,6 +1,6 @@
 # fastcp
 
-一个用 C++17 编写的高速多连接文件同步工具。通过 TCP 将目录从server同步到一个或多个client，支持并行连接、内存映射 I/O、流水线同步、块级断点续传、Delta 增量同步和完整性校验。
+一个用 C++17 编写的高速多连接文件同步工具。通过 TCP 将目录从server同步到一个或多个client，支持并行连接、流水线同步、虚拟字节流、块级断点续传、Delta 增量同步和完整性校验。
 
 ---
 
@@ -14,8 +14,6 @@ fastcp_server /opt/data 0.0.0.0 9999
 fastcp_client /home/user/data 192.168.1.1 9999
 ```
 
-先启动服务器。客户端支持指数退避重试连接，可以在服务器启动前运行（`--retry N`）。多个客户端可以同时连接。
-
 ---
 
 ## 接口说明
@@ -25,10 +23,10 @@ fastcp_server <src_dir> <ip> <port> [选项]
 fastcp_client <dst_dir> <ip> <port> [选项]
 ```
 
-| 角色       | 可执行文件      | 职责                                                         |
-| ---------- | --------------- | ------------------------------------------------------------ |
-| **server** | `fastcp_server` | 持久守护进程：绑定 `ip:port`，启动时扫描 `src_dir` 一次；同时服务多个并发客户端会话 |
-| **client** | `fastcp_client` | 连接服务器；打开 N 个并行 TCP 连接；将文件接收/同步到 `dst_dir` |
+| 角色       | 职责                                                         |
+| ---------- | ------------------------------------------------------------ |
+| **server** | 持久守护进程：绑定 `ip:port`，启动时扫描 `src_dir` 一次；同时服务多个并发客户端会话 |
+| **client** | 连接服务器；打开 N 个并行 TCP 连接；将文件接收/同步到 `dst_dir` |
 
 服务器端的 `<ip>` 是**监听地址**（如 `0.0.0.0` 表示所有接口）。
 
@@ -129,14 +127,16 @@ docker run --rm fastcp:linux /fastcp/build/bin/fastcp_server --help
 
 握手期间协商功能位（`capabilities` 位掩码）：
 
-| 位     | 功能                  | 说明                              |
-| ------ | --------------------- | --------------------------------- |
-| 0x0001 | `CAP_COMPRESS`        | 逐块 zstd 压缩                    |
-| 0x0002 | `CAP_RESUME`          | 文件级偏移断点续传                |
-| 0x0004 | `CAP_BUNDLE`          | 小文件打包传输                    |
-| 0x0008 | `CAP_DELTA`           | rsync 风格块级 Delta 同步         |
-| 0x0010 | `CAP_VIRTUAL_ARCHIVE` | 虚拟字节流                        |
-| 0x0020 | `CAP_CHUNK_RESUME`    | 块级哈希断点续传                  |
-| 0x0040 | `CAP_PIPELINE_SYNC`   | 流水线文件树推送 + WANT_FILE 拉取 |
+| 位     | 功能                  | 说明                                     |
+| ------ | --------------------- | ---------------------------------------- |
+| 0x0001 | `CAP_COMPRESS`        | 逐块 zstd 压缩                           |
+| 0x0002 | `CAP_RESUME`          | 文件级偏移断点续传                       |
+| 0x0004 | `CAP_BUNDLE`          | 小文件打包传输                           |
+| 0x0008 | `CAP_DELTA`           | rsync 风格块级 Delta 同步                |
+| 0x0010 | `CAP_VIRTUAL_ARCHIVE` | 虚拟字节流                               |
+| 0x0020 | `CAP_CHUNK_RESUME`    | 块级哈希断点续传                         |
+| 0x0040 | `CAP_PIPELINE_SYNC`   | 流水线文件树推送 + WANT_FILE 拉取        |
+| 0x0080 | `CAP_TREE_CACHE`      | 客户端缓存文件树 token；HIT 时跳过树传输 |
+| 0x0100 | CAP_COMPRESSED_TREE`  | 服务端以单个 zstd blob 发送文件列表      |
 
-全功能协商后位掩码为 `0x007e`。
+全功能协商后位掩码为 `0x01fe`。
