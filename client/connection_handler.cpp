@@ -9,10 +9,18 @@
 #include "../common/file_io.hpp"
 #include "../common/hash.hpp"
 #include "../common/compress.hpp"
+#include "../common/write_buffer.hpp"
+#include <algorithm>
 #include <cstring>
 #include <vector>
 #include <filesystem>
 #include <chrono>
+#include <fstream>
+#include <thread>
+#include <unordered_map>
+#ifndef _WIN32
+#  include <sys/stat.h>
+#endif
 
 namespace fs = std::filesystem;
 
@@ -54,12 +62,24 @@ void ConnectionHandler::run() {
         if (conn_index_ == 0) {
             bool use_pipeline = session_ &&
                                 (session_->capabilities & CAP_PIPELINE_SYNC);
+            bool use_va_direct = session_ &&
+                                 (session_->capabilities & CAP_VIRTUAL_ARCHIVE) &&
+                                 !(session_->capabilities & CAP_PIPELINE_SYNC);
             if (use_pipeline) {
                 // Pipeline mode: read file tree, check files locally, send WANT_FILE
                 if (!handle_pipeline_file_tree()) {
                     LOG_ERROR("Pipeline file tree failed");
                     return;
                 }
+            } else if (use_va_direct) {
+                // VA direct mode: server sends archive manifest directly, no file
+                // list exchange. Signal secondary connections immediately so they
+                // can enter handle_transfer_loop() without waiting.
+                {
+                    std::lock_guard<std::mutex> lk(session_->file_list_mutex);
+                    session_->file_list_ready = true;
+                }
+                session_->file_list_cv.notify_all();
             } else {
                 if (!handle_file_list()) {
                     LOG_ERROR("File list exchange failed");
@@ -587,6 +607,12 @@ bool ConnectionHandler::on_session_done() {
                              && session_->files_total.load() > 0);
             if (all_done) {
                 session_->transfer_index->destroy();
+                // Finalize VA progress file: delete on success, save on partial
+                if (session_->shared_archive_receiver) {
+                    auto ar = std::static_pointer_cast<ArchiveReceiver>(
+                        session_->shared_archive_receiver);
+                    ar->finish_progress();
+                }
             }
         }
     }
@@ -622,8 +648,110 @@ void ConnectionHandler::send_error(const std::string& msg) {
 
 // ---- PIPELINE FILE TREE ----
 
+// Temp files are stored under dst/.fastcp/ to avoid cluttering the user's
+// destination directory.  Names include a dir_id suffix so that different
+// source directories (even on the same server) don't share state.
+
+static std::string bytes_to_hex8(const u8* b) {
+    // First 8 bytes → 16 hex chars (enough to be unique)
+    char buf[17];
+    snprintf(buf, sizeof(buf),
+             "%02x%02x%02x%02x%02x%02x%02x%02x",
+             b[0],b[1],b[2],b[3],b[4],b[5],b[6],b[7]);
+    return std::string(buf);
+}
+
+// Tree cache: dst/.fastcp/treecache_<dir_id_hex>
+static std::string tree_cache_path(const std::string& root, const u8 dir_id[16]) {
+    std::error_code ec;
+    fs::create_directories(fs::path(root) / ".fastcp", ec);
+    return (fs::path(root) / ".fastcp" / ("treecache_" + bytes_to_hex8(dir_id))).string();
+}
+
+// VA progress: dst/.fastcp/va_progress_<archive_token_hex>
+static std::string va_progress_path(const std::string& root, const u8 archive_token[16]) {
+    std::error_code ec;
+    fs::create_directories(fs::path(root) / ".fastcp", ec);
+    return (fs::path(root) / ".fastcp" / ("va_progress_" + bytes_to_hex8(archive_token))).string();
+}
+
+// Legacy path (old installs): dst/.fastcp_treecache
+static std::string tree_cache_path_legacy(const std::string& root) {
+    return (fs::path(root) / ".fastcp_treecache").string();
+}
+
+// Tree cache file layout (dst/.fastcp/treecache_<dir_id_hex>):
+//   [16] tree_token  [4-LE] entry_count
+//   per entry: [4] file_id  [8] file_size  [8] mtime_ns  [16] xxh3_128
+//              [2] path_len  [1] flags  [path_len] rel_path
+
+static bool load_tree_cache(const std::string& root,
+                            const u8 dir_id[16],
+                            u8 token_out[16],
+                            std::vector<ClientFileEntry>& list_out)
+{
+    // Try new path first, fall back to legacy path for old installs
+    std::string path = tree_cache_path(root, dir_id);
+    std::ifstream f(path, std::ios::binary);
+    if (!f) {
+        // Legacy fallback: old installs used .fastcp_treecache (no dir_id)
+        f.open(tree_cache_path_legacy(root), std::ios::binary);
+        if (!f) return false;
+    }
+
+    u8 tok[16]; f.read((char*)tok, 16);
+    u32 cnt = 0; f.read((char*)&cnt, 4);
+    if (!f || cnt > 10000000u) return false;
+
+    std::vector<ClientFileEntry> entries;
+    entries.reserve(cnt);
+    for (u32 i = 0; i < cnt; ++i) {
+        ClientFileEntry e{};
+        f.read((char*)&e.file_id,   4);
+        f.read((char*)&e.file_size, 8);
+        f.read((char*)&e.mtime_ns,  8);
+        f.read((char*)e.xxh3_128,  16);
+        u16 plen = 0; f.read((char*)&plen, 2);
+        f.read((char*)&e.flags, 1);
+        if (!f || plen > 4096) return false;
+        e.rel_path.resize(plen);
+        f.read(&e.rel_path[0], plen);
+        if (!f) return false;
+        entries.push_back(std::move(e));
+    }
+
+    std::memcpy(token_out, tok, 16);
+    list_out = std::move(entries);
+    return true;
+}
+
+static void save_tree_cache(const std::string& root,
+                            const u8 dir_id[16],
+                            const u8 token[16],
+                            const std::vector<ClientFileEntry>& list)
+{
+    std::ofstream f(tree_cache_path(root, dir_id), std::ios::binary | std::ios::trunc);
+    if (!f) return;
+
+    f.write((char*)token, 16);
+    u32 cnt = (u32)list.size();
+    f.write((char*)&cnt, 4);
+    for (const auto& e : list) {
+        f.write((char*)&e.file_id,   4);
+        f.write((char*)&e.file_size, 8);
+        f.write((char*)&e.mtime_ns,  8);
+        f.write((char*)e.xxh3_128,  16);
+        u16 plen = (u16)e.rel_path.size();
+        f.write((char*)&plen, 2);
+        f.write((char*)&e.flags, 1);
+        f.write(e.rel_path.data(), plen);
+    }
+}
+
 bool ConnectionHandler::handle_pipeline_file_tree() {
-    // ---- Step 1: Read server's file tree ----
+    bool use_tree_cache = (session_->capabilities & CAP_TREE_CACHE) != 0;
+
+    // ---- Step 1: Read FILE_LIST_BEGIN ----
     FrameHeader hdr{}; std::vector<u8> payload;
     if (!sock_.read_frame(hdr, payload)) return false;
     if ((MsgType)hdr.msg_type != MsgType::MT_FILE_LIST_BEGIN) {
@@ -631,113 +759,235 @@ bool ConnectionHandler::handle_pipeline_file_tree() {
         return false;
     }
 
-    for (;;) {
-        if (!sock_.read_frame(hdr, payload)) return false;
-        if ((MsgType)hdr.msg_type == MsgType::MT_FILE_LIST_END) break;
-        if ((MsgType)hdr.msg_type != MsgType::MT_FILE_LIST_ENTRY) continue;
-        if (payload.size() < sizeof(FileListEntry)) continue;
-
+    // Helper: parse one FileListEntry+path from a flat byte buffer.
+    // Defined here (before any goto) to avoid "jumps over initialisation" warning.
+    auto parse_one_entry = [&](const u8* base, size_t buf_size, size_t& off) -> bool {
+        if (off + sizeof(FileListEntry) > buf_size) return false;
         FileListEntry entry{};
-        std::memcpy(&entry, payload.data(), sizeof(FileListEntry));
+        std::memcpy(&entry, base + off, sizeof(FileListEntry));
         proto::decode_file_list_entry(entry);
-
-        size_t path_off = sizeof(FileListEntry);
-        if (payload.size() < path_off + entry.path_len) continue;
-
+        off += sizeof(FileListEntry);
+        if (off + entry.path_len > buf_size) return false;
         ClientFileEntry cfe;
         cfe.file_id   = entry.file_id;
         cfe.file_size = entry.file_size;
         cfe.mtime_ns  = entry.mtime_ns;
         cfe.flags     = entry.flags;
         std::memcpy(cfe.xxh3_128, entry.xxh3_128, 16);
-        cfe.rel_path.assign((char*)(payload.data() + path_off), entry.path_len);
+        cfe.rel_path.assign((char*)(base + off), entry.path_len);
+        off += entry.path_len;
         session_->file_list.push_back(std::move(cfe));
+        return true;
+    };
+
+    // ---- FIX 3: Tree cache check ----
+    // When CAP_TREE_CACHE is agreed and the server embeds a 32-byte payload in
+    // FILE_LIST_BEGIN ([tree_token(16)][dir_id(16)]), compare the token with the
+    // local cache keyed by dir_id. On a match the client sends MT_TREE_CACHE_HIT
+    // and reuses the cached file list, avoiding the full ~540 KB file tree transfer.
+    bool cache_hit = false;
+    if (use_tree_cache && payload.size() >= 16) {
+        const u8* server_token = payload.data();
+
+        // Extract dir_id if present (new protocol: payload >= 32 bytes)
+        if (payload.size() >= 32) {
+            std::memcpy(session_->dir_id, payload.data() + 16, 16);
+        }
+        // else: old server without dir_id — dir_id stays all-zero (legacy behaviour)
+
+        // Try to load our cached file list (populated during a previous sync)
+        u8 cached_token[16]{};
+        std::vector<ClientFileEntry> cached_list;
+        bool have_cache = load_tree_cache(session_->root_dir, session_->dir_id,
+                                          cached_token, cached_list);
+
+        if (have_cache && std::memcmp(cached_token, server_token, 16) == 0) {
+            // Cache HIT: tell server to skip sending entries
+            sock_.write_frame(MsgType::MT_TREE_CACHE_HIT, 0, nullptr, 0);
+
+            session_->file_list = std::move(cached_list);
+            session_->files_total.store((u32)session_->file_list.size());
+
+            {
+                std::lock_guard<std::mutex> lk(session_->file_list_mutex);
+                session_->file_list_ready = true;
+            }
+            session_->file_list_cv.notify_all();
+
+            LOG_INFO("Pipeline: tree cache HIT (" +
+                     std::to_string(session_->file_list.size()) + " files from cache)");
+            cache_hit = true;
+        } else {
+            // Cache MISS: tell server to send the full file tree
+            sock_.write_frame(MsgType::MT_TREE_CACHE_MISS, 0, nullptr, 0);
+            // Save the new token so we can save the cache after receiving entries
+            std::memcpy(session_->cached_tree_token, server_token, 16);
+            session_->have_tree_cache = true;
+        }
     }
 
-    session_->files_total.store((u32)session_->file_list.size());
+    if (!cache_hit) {
+        // ---- Read file list: compressed (CAP_COMPRESSED_TREE) or individual entries ----
+        bool use_compressed_tree = (session_->capabilities & CAP_COMPRESSED_TREE) != 0;
 
-    // Signal secondary connections that they may enter handle_transfer_loop().
-    // Do this BEFORE local file checking so conn[1..N-1] are ready to receive
-    // data as soon as the server starts dispatching.
-    {
-        std::lock_guard<std::mutex> lk(session_->file_list_mutex);
-        session_->file_list_ready = true;
-    }
-    session_->file_list_cv.notify_all();
-
-    LOG_INFO("Pipeline: file tree received (" +
-             std::to_string(session_->file_list.size()) + " files)");
-
-    // ---- Step 2: Check each file, send WANT_FILE for any that need transfer ----
-    for (auto& cfe : session_->file_list) {
-        fs::path abs_path;
-        try {
-            abs_path = file_io::proto_to_fspath(session_->root_dir, cfe.rel_path);
-        } catch (...) {
-            // Cannot determine local path → request the file
-            WantFileMsg wmsg{};
-            wmsg.file_id = cfe.file_id;
-            wmsg.reason  = 0;
-            WantFileMsg enc = wmsg;
-            proto::encode_want_file_msg(enc);
-            sock_.write_frame(MsgType::MT_WANT_FILE, 0, &enc, sizeof(enc));
-            continue;
+        if (use_compressed_tree) {
+            // Server sends a single MT_FILE_LIST_COMPRESSED frame:
+            //   [4-byte LE original_size][zstd-compressed FileListEntry+path blob]
+            if (!sock_.read_frame(hdr, payload)) return false;
+            if ((MsgType)hdr.msg_type == MsgType::MT_FILE_LIST_COMPRESSED &&
+                payload.size() >= 4)
+            {
+                u32 orig_size = 0;
+                std::memcpy(&orig_size, payload.data(), 4);
+                std::vector<u8> raw =
+                    compress::decompress_to_vec(payload.data() + 4,
+                                                payload.size() - 4,
+                                                (size_t)orig_size);
+                size_t off = 0;
+                while (off < raw.size())
+                    if (!parse_one_entry(raw.data(), raw.size(), off)) break;
+                LOG_INFO("Pipeline: received compressed file tree (" +
+                         std::to_string(session_->file_list.size()) + " entries, " +
+                         std::to_string(payload.size()) + " → " +
+                         std::to_string(raw.size()) + " bytes)");
+            }
+        } else {
+            // Legacy: individual MT_FILE_LIST_ENTRY frames terminated by FILE_LIST_END
+            for (;;) {
+                if (!sock_.read_frame(hdr, payload)) return false;
+                if ((MsgType)hdr.msg_type == MsgType::MT_FILE_LIST_END) break;
+                if ((MsgType)hdr.msg_type != MsgType::MT_FILE_LIST_ENTRY) continue;
+                if (payload.size() < sizeof(FileListEntry)) continue;
+                size_t off = 0;
+                parse_one_entry(payload.data(), payload.size(), off);
+            }
         }
 
-        std::error_code ec;
-        bool exists    = fs::exists(abs_path, ec);
-        u64  loc_size  = exists ? file_io::get_file_size(abs_path.string()) : 0;
+        session_->files_total.store((u32)session_->file_list.size());
 
-        if (!exists || loc_size != cfe.file_size) {
+        // Save tree cache after receiving the full list
+        if (session_->have_tree_cache) {
+            save_tree_cache(session_->root_dir,
+                            session_->dir_id,
+                            session_->cached_tree_token,
+                            session_->file_list);
+            LOG_INFO("Pipeline: tree cache saved (" +
+                     std::to_string(session_->file_list.size()) + " entries)");
+        }
+
+        // Signal secondary connections that they may enter handle_transfer_loop()
+        {
+            std::lock_guard<std::mutex> lk(session_->file_list_mutex);
+            session_->file_list_ready = true;
+        }
+        session_->file_list_cv.notify_all();
+
+        LOG_INFO("Pipeline: file tree received (" +
+                 std::to_string(session_->file_list.size()) + " files)");
+    }
+
+    // ---- Step 2: Check each file, send WANT_FILE for any that need transfer ----
+    // Stat each file in the server's list in parallel (8 threads).
+    // On Windows NTFS this reduces 10k × ~300µs calls from ~3s to ~400ms.
+    struct LocalInfo { u64 size; u64 mtime_ns; bool exists; };
+    std::vector<LocalInfo> local_info(session_->file_list.size());
+    {
+        const int NTHREADS = 8;
+        size_t n = session_->file_list.size();
+        std::vector<std::thread> workers;
+        workers.reserve(NTHREADS);
+        for (int t = 0; t < NTHREADS; ++t) {
+            workers.emplace_back([&, t]() {
+                for (size_t i = (size_t)t; i < n; i += (size_t)NTHREADS) {
+                    const auto& cfe = session_->file_list[i];
+                    auto& li = local_info[i];
+                    li.exists = false;
+                    fs::path abs = file_io::proto_to_fspath(
+                        session_->root_dir, cfe.rel_path);
+#ifdef _WIN32
+                    WIN32_FILE_ATTRIBUTE_DATA info{};
+                    if (GetFileAttributesExA(abs.string().c_str(),
+                                             GetFileExInfoStandard, &info)) {
+                        li.exists = true;
+                        li.size   = ((u64)info.nFileSizeHigh << 32) | info.nFileSizeLow;
+                        u64 ft    = ((u64)info.ftLastWriteTime.dwHighDateTime << 32)
+                                  | info.ftLastWriteTime.dwLowDateTime;
+                        li.mtime_ns = (ft >= 116444736000000000ULL)
+                                    ? (ft - 116444736000000000ULL) * 100ULL : 0;
+                    }
+#else
+                    struct ::stat st{};
+                    if (::stat(abs.c_str(), &st) == 0) {
+                        li.exists   = true;
+                        li.size     = (u64)st.st_size;
+                        li.mtime_ns = (u64)st.st_mtim.tv_sec * 1000000000ULL
+                                    + (u64)st.st_mtim.tv_nsec;
+                    }
+#endif
+                }
+            });
+        }
+        for (auto& w : workers) w.join();
+    }
+
+    // Buffer all WANT_FILE decisions so they are sent in a few large writes
+    // instead of one write() syscall per file.  For 10 000 files this reduces
+    // ~10 000 write() calls (~300 ms overhead) to ~10 calls.
+    TcpWriteBuffer wbuf(sock_);
+
+    for (size_t i = 0; i < session_->file_list.size(); ++i) {
+        const auto& cfe = session_->file_list[i];
+        const auto& li  = local_info[i];
+
+        if (!li.exists || li.size != cfe.file_size) {
             // File missing or size mismatch → request full transfer
             WantFileMsg wmsg{};
             wmsg.file_id = cfe.file_id;
             wmsg.reason  = 0;
             WantFileMsg enc = wmsg;
             proto::encode_want_file_msg(enc);
-            sock_.write_frame(MsgType::MT_WANT_FILE, 0, &enc, sizeof(enc));
+            wbuf.write_frame(MsgType::MT_WANT_FILE, 0, &enc, sizeof(enc));
+        } else if (li.mtime_ns == cfe.mtime_ns) {
+            // Size + mtime match → skip
+            session_->files_done.fetch_add(1);
         } else {
-            // Size matches → check mtime (rsync fast path)
-            u64 loc_mtime = file_io::get_mtime_ns(abs_path.string());
-            if (loc_mtime == cfe.mtime_ns) {
-                // Timestamps identical → assume content up-to-date
+            // mtime differs → check content hash if server provided one
+            bool has_server_hash = false;
+            for (int b = 0; b < 16; ++b) {
+                if (cfe.xxh3_128[b] != 0) { has_server_hash = true; break; }
+            }
+
+            bool content_ok = false;
+            if (has_server_hash) {
+                try {
+                    fs::path abs_path = file_io::proto_to_fspath(
+                        session_->root_dir, cfe.rel_path);
+                    file_io::MmapReader reader(abs_path.string());
+                    if (reader.data()) {
+                        hash::Hash128 h =
+                            hash::xxh3_128(reader.data(), reader.size());
+                        content_ok =
+                            (std::memcmp(h.data(), cfe.xxh3_128, 16) == 0);
+                    }
+                } catch (...) {}
+            }
+
+            if (content_ok) {
                 session_->files_done.fetch_add(1);
             } else {
-                // mtime differs → verify content hash if server provided one
-                bool has_server_hash = false;
-                for (int b = 0; b < 16; ++b) {
-                    if (cfe.xxh3_128[b] != 0) { has_server_hash = true; break; }
-                }
-
-                bool content_ok = false;
-                if (has_server_hash) {
-                    try {
-                        file_io::MmapReader reader(abs_path.string());
-                        if (reader.data()) {
-                            hash::Hash128 h =
-                                hash::xxh3_128(reader.data(), reader.size());
-                            content_ok =
-                                (std::memcmp(h.data(), cfe.xxh3_128, 16) == 0);
-                        }
-                    } catch (...) {}
-                }
-
-                if (content_ok) {
-                    session_->files_done.fetch_add(1); // content identical, skip
-                } else {
-                    WantFileMsg wmsg{};
-                    wmsg.file_id = cfe.file_id;
-                    wmsg.reason  = has_server_hash ? u8(2) : u8(1); // 2=hash_diff, 1=mtime_diff
-                    WantFileMsg enc = wmsg;
-                    proto::encode_want_file_msg(enc);
-                    sock_.write_frame(MsgType::MT_WANT_FILE, 0, &enc, sizeof(enc));
-                }
+                WantFileMsg wmsg{};
+                wmsg.file_id = cfe.file_id;
+                wmsg.reason  = has_server_hash ? u8(2) : u8(1);
+                WantFileMsg enc = wmsg;
+                proto::encode_want_file_msg(enc);
+                wbuf.write_frame(MsgType::MT_WANT_FILE, 0, &enc, sizeof(enc));
             }
         }
     }
 
     // ---- Step 3: Notify server that all files have been checked ----
-    sock_.write_frame(MsgType::MT_FILE_CHECK_DONE, 0, nullptr, 0);
+    wbuf.write_frame(MsgType::MT_FILE_CHECK_DONE, 0, nullptr, 0);
+    wbuf.flush();  // send WANT_FILEs + FILE_CHECK_DONE in one batch
     LOG_INFO("Pipeline: FILE_CHECK_DONE sent");
     return true;
 }
@@ -809,6 +1059,8 @@ bool ConnectionHandler::on_archive_manifest_hdr(const std::vector<u8>& payload) 
     if (payload.size() < sizeof(ArchiveManifestHdr)) return false;
     std::memcpy(&pending_manifest_hdr_, payload.data(), sizeof(ArchiveManifestHdr));
     proto::decode_archive_manifest_hdr(pending_manifest_hdr_);
+    // Extract dir_id from manifest and store in session for temp-file naming
+    std::memcpy(session_->dir_id, pending_manifest_hdr_.dir_id, 16);
     pending_archive_slots_.clear();
     pending_archive_slots_.reserve(pending_manifest_hdr_.total_files);
     LOG_DEBUG("ARCHIVE_MANIFEST_HDR: files=" +
@@ -847,7 +1099,47 @@ bool ConnectionHandler::on_archive_file_entry(const std::vector<u8>& payload) {
     std::memcpy(slot.expected_hash, fe.xxh3_128, 16);
 
     pending_archive_slots_.push_back(std::move(slot));
+
+    // Accumulate a lightweight entry for tree-cache saving after VA transfer
+    if (conn_index_ == 0) {
+        ClientFileEntry cfe;
+        cfe.file_id   = fe.file_id;
+        cfe.file_size = fe.file_size;
+        cfe.mtime_ns  = fe.mtime_ns;
+        cfe.flags     = 0;
+        std::memcpy(cfe.xxh3_128, fe.xxh3_128, 16);
+        cfe.rel_path  = rel_path;
+        pending_archive_file_entries_.push_back(std::move(cfe));
+    }
     return true;
+}
+
+// Compute tree token matching server's compute_tree_token() in server_app.cpp:
+// xxh3-128 of sorted (rel_path + mtime_ns + file_size) for every entry.
+// This must produce the same result so pipeline sync TREE_CACHE_HIT works after a VA run.
+static hash::Hash128 compute_tree_token_from_entries(
+    const std::vector<ClientFileEntry>& entries)
+{
+    std::vector<const ClientFileEntry*> sorted;
+    sorted.reserve(entries.size());
+    for (const auto& e : entries) sorted.push_back(&e);
+    std::sort(sorted.begin(), sorted.end(),
+              [](const ClientFileEntry* a, const ClientFileEntry* b) {
+                  return a->rel_path < b->rel_path;
+              });
+
+    std::vector<u8> buf;
+    buf.reserve(sorted.size() * 32);
+    for (const ClientFileEntry* e : sorted) {
+        buf.insert(buf.end(), e->rel_path.begin(), e->rel_path.end());
+        u64 mt = e->mtime_ns;
+        u64 sz = e->file_size;
+        const u8* mp = reinterpret_cast<const u8*>(&mt);
+        const u8* sp = reinterpret_cast<const u8*>(&sz);
+        buf.insert(buf.end(), mp, mp + 8);
+        buf.insert(buf.end(), sp, sp + 8);
+    }
+    return hash::xxh3_128(buf.data(), buf.size());
 }
 
 bool ConnectionHandler::on_archive_manifest_end() {
@@ -861,7 +1153,50 @@ bool ConnectionHandler::on_archive_manifest_end() {
              pending_manifest_hdr_.total_virtual_size);
     pending_archive_slots_.clear();
 
-    // Preallocate all target files
+    // ---- VA Resume: compute manifest token and load progress file ----
+    // The token is a 16-byte hash of all archive file entries (sorted by
+    // file_id). It uniquely identifies this particular transfer so we can
+    // safely reuse a progress file from a previous interrupted run.
+    {
+        // Collect file entry data from the receiver's internal slots.
+        // We rebuild from the archive receiver's build_needed_chunks() info
+        // via the session's archive slots captured above. Since we already
+        // moved the slots into the receiver, compute the token from the
+        // manifest HDR fields + the received slot data in `ar`.
+        // Strategy: concatenate (file_id + virtual_offset + file_size +
+        //           mtime_ns + xxh3_128) for each slot sorted by file_id,
+        //           then hash. This is deterministic across reconnects.
+        //
+        // Compute the tree token using the SAME algorithm as the server's
+        // compute_tree_token() in server_app.cpp: xxh3-128 of sorted
+        // (rel_path + mtime_ns + file_size). This ensures that after a VA
+        // transfer, the saved tree cache token matches what the server will
+        // send in the next pipeline sync's FILE_LIST_BEGIN, enabling TREE_CACHE_HIT.
+        hash::Hash128 tok = compute_tree_token_from_entries(pending_archive_file_entries_);
+        u8 tok_bytes[16];
+        hash::to_bytes(tok, tok_bytes);
+
+        std::string progress_path =
+            va_progress_path(session_->root_dir, tok_bytes);
+        ar->set_progress(progress_path, tok_bytes);
+
+        // Save tree cache so the NEXT run can detect that files exist in dst
+        // and use Pipeline Sync instead of Virtual Archive.
+        // We do this here (not in on_session_done) so the cache is written even
+        // if the transfer is interrupted mid-way: the first file will be on disk
+        // and the next run will correctly enter Pipeline Sync mode.
+        if (!pending_archive_file_entries_.empty()) {
+            save_tree_cache(session_->root_dir,
+                            session_->dir_id,
+                            tok_bytes,
+                            pending_archive_file_entries_);
+            pending_archive_file_entries_.clear();
+            LOG_INFO("VA: tree cache saved (" +
+                     std::to_string(ar->total_chunks()) + " chunks)");
+        }
+    }
+
+    // Preallocate all target files (resume-aware: won't truncate if progress loaded)
     ar->preallocate_all();
 
     // Store in session and signal secondary connections
@@ -872,7 +1207,7 @@ bool ConnectionHandler::on_archive_manifest_end() {
     session_->archive_receiver_cv.notify_all();
     archive_receiver_ = ar;
 
-    // Build and send CHUNK_REQUEST
+    // Build and send CHUNK_REQUEST (only the chunks we still need)
     std::vector<u32> needed = ar->build_needed_chunks();
 
     ChunkRequestHdr req_hdr{};
@@ -892,7 +1227,8 @@ bool ConnectionHandler::on_archive_manifest_end() {
     sock_.write_frame(MsgType::MT_CHUNK_REQUEST, 0,
                       payload.data(), (u32)payload.size());
 
-    LOG_INFO("CHUNK_REQUEST sent: " + std::to_string(needed.size()) + " chunks");
+    LOG_INFO("CHUNK_REQUEST sent: " + std::to_string(needed.size()) +
+             "/" + std::to_string(ar->total_chunks()) + " chunks needed");
     return true;
 }
 

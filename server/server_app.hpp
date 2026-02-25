@@ -40,6 +40,7 @@ struct ServerConfig {
     bool        use_compress{true};
     u32         chunk_size{DEFAULT_CHUNK_SIZE};
     int         max_chunks{0};  // test-only: abort after N chunks (0=unlimited)
+    u8          dir_id[16]{};   // UUID for src_dir, loaded/created at startup
 };
 
 // Sync plan received from the client during negotiation
@@ -135,6 +136,11 @@ private:
     std::vector<FileEntry> entries_;        // pre-scanned, reused per session
     u64                    total_bytes_{0};
     std::mutex             entries_mutex_;
+
+    // Set to true when the first client session starts, signalling the
+    // background hasher to stop early (it competes for disk I/O with
+    // read_chunk / pre_read_all once a transfer is in progress).
+    std::atomic<bool>      bg_hasher_stop_{false};
 
     // --- Connector threads (one per accepted socket, short-lived) ---
     std::vector<std::thread> connector_threads_;

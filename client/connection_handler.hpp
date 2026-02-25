@@ -53,6 +53,8 @@ private:
     // Temporary accumulation of archive manifest entries (conn[0] only)
     ArchiveManifestHdr            pending_manifest_hdr_{};
     std::vector<ArchiveFileSlot>  pending_archive_slots_;
+    // Parallel lightweight list for tree-cache save after VA transfer
+    std::vector<ClientFileEntry>  pending_archive_file_entries_;
 
     // ---- State handlers ----
     bool handle_handshake();

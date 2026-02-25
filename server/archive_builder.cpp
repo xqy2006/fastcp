@@ -8,11 +8,14 @@
 #include <algorithm>
 #include <cstring>
 #include <stdexcept>
+#include <thread>
+#include <vector>
 
 void ArchiveBuilder::build(const std::vector<FileEntry>& entries, u32 chunk_size) {
     chunk_size_ = (chunk_size > 0) ? chunk_size : DEFAULT_CHUNK_SIZE;
     files_.clear();
     chunks_.clear();
+    pre_read_buf_.clear();
     total_size_ = 0;
 
     // 1. Assign virtual offsets to each file in order
@@ -72,6 +75,69 @@ void ArchiveBuilder::build(const std::vector<FileEntry>& entries, u32 chunk_size
     }
 }
 
+bool ArchiveBuilder::pre_read_all(u64 max_bytes) {
+    if (total_size_ == 0) return true;
+    if (total_size_ > max_bytes) return false;
+
+    pre_read_buf_.assign((size_t)total_size_, 0);
+
+    // Parallel read: split files across N worker threads.
+    // On Linux overlayfs each open() costs ~400 µs; 8 threads reduce
+    // 10 000 files from ~4 s serial to ~0.5 s parallel.
+    // On Windows NTFS the gain is smaller but still meaningful.
+    const int NTHREADS = 8;
+    size_t n = files_.size();
+    std::vector<std::thread> workers;
+    workers.reserve(NTHREADS);
+
+    for (int t = 0; t < NTHREADS; ++t) {
+        workers.emplace_back([&, t]() {
+            for (size_t i = (size_t)t; i < n; i += (size_t)NTHREADS) {
+                auto& vf = files_[i];
+                if (vf.file_size == 0) {
+                    if (hash::is_zero(vf.xxh3_128))
+                        vf.xxh3_128 = hash::xxh3_128(nullptr, 0);
+                    continue;
+                }
+
+                u8* dst = pre_read_buf_.data() + vf.virtual_offset;
+                bool ok = false;
+
+#ifndef _WIN32
+                // O_NOATIME: skip atime update on overlayfs (saves a metadata write per file).
+                // pread: no implicit lseek, safe for concurrent threads sharing no fd state.
+                int fd = ::open(vf.abs_path.c_str(), O_RDONLY | O_NOATIME);
+                if (fd < 0) fd = ::open(vf.abs_path.c_str(), O_RDONLY); // fallback if EPERM
+                if (fd >= 0) {
+                    ssize_t nr = ::pread(fd, dst, (size_t)vf.file_size, 0);
+                    ::close(fd);
+                    ok = (nr == (ssize_t)vf.file_size);
+                }
+#else
+                HANDLE h = CreateFileA(vf.abs_path.c_str(),
+                                       GENERIC_READ, FILE_SHARE_READ, nullptr,
+                                       OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+                if (h != INVALID_HANDLE_VALUE) {
+                    DWORD nr = 0;
+                    ReadFile(h, dst, (DWORD)vf.file_size, &nr, nullptr);
+                    CloseHandle(h);
+                    ok = (nr == (DWORD)vf.file_size);
+                }
+#endif
+                if (ok) {
+                    vf.xxh3_128 = hash::xxh3_128(dst, (size_t)vf.file_size);
+                } else {
+                    LOG_WARN("archive_builder: pre_read_all: cannot read " + vf.abs_path);
+                    std::memset(dst, 0, (size_t)vf.file_size);
+                }
+            }
+        });
+    }
+    for (auto& w : workers) w.join();
+
+    return true;
+}
+
 std::vector<u8> ArchiveBuilder::read_chunk(u32 chunk_id) const {
     if (chunk_id >= (u32)chunks_.size()) {
         throw std::out_of_range("read_chunk: invalid chunk_id " +
@@ -81,6 +147,21 @@ std::vector<u8> ArchiveBuilder::read_chunk(u32 chunk_id) const {
     const VirtualChunk& vc = chunks_[chunk_id];
     std::vector<u8> buf(vc.raw_size, 0);
 
+    // Fast path: serve from the pre-read in-memory buffer (no disk I/O).
+    if (!pre_read_buf_.empty()) {
+        u64 chunk_start = vc.archive_offset;
+        u64 available   = pre_read_buf_.size() >= chunk_start
+                          ? pre_read_buf_.size() - chunk_start : 0;
+        u32 copy_len    = (u32)std::min((u64)vc.raw_size, available);
+        if (copy_len > 0) {
+            std::memcpy(buf.data(), pre_read_buf_.data() + chunk_start, copy_len);
+        }
+        return buf;
+    }
+
+    // Slow path: open each source file individually (MmapReader).
+    // Used when pre_read_all() was not called or the archive exceeds the
+    // memory limit (> PRE_READ_MAX_BYTES).
     u64 chunk_start = vc.archive_offset;
 
     for (const ChunkSpan& span : vc.spans) {
@@ -100,7 +181,6 @@ std::vector<u8> ArchiveBuilder::read_chunk(u32 chunk_id) const {
             u32 copy_len  = (u32)std::min((u64)span.length, available);
 
             if (buf_offset + copy_len > buf.size()) {
-                // Clamp to buffer boundary (should not happen with correct layout)
                 copy_len = (u32)(buf.size() - buf_offset);
             }
 

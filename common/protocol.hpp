@@ -28,6 +28,9 @@ enum class MsgType : u16 {
     MT_FILE_LIST_BEGIN = 0x0010,
     MT_FILE_LIST_ENTRY = 0x0011,
     MT_FILE_LIST_END   = 0x0012,
+    MT_TREE_CACHE_HIT  = 0x0013,  // client→server: cached tree matches token, skip entries
+    MT_TREE_CACHE_MISS = 0x0014,  // client→server: no cache or mismatch, send full tree
+    MT_FILE_LIST_COMPRESSED = 0x0015, // server→client: zstd-compressed file list (replaces ENTRY/END)
 
     MT_SYNC_PLAN_BEGIN = 0x0020,
     MT_SYNC_PLAN_ENTRY = 0x0021,
@@ -94,6 +97,8 @@ enum Capabilities : u16 {
     CAP_VIRTUAL_ARCHIVE  = 0x0010,  // virtual archive (Steam Depot style streaming)
     CAP_CHUNK_RESUME     = 0x0020,  // chunk-level resume (per-chunk hash verification)
     CAP_PIPELINE_SYNC    = 0x0040,  // pipeline sync (WANT_FILE streaming, decoupled transfer)
+    CAP_TREE_CACHE       = 0x0080,  // client caches file tree by token; skips tree on HIT
+    CAP_COMPRESSED_TREE  = 0x0100,  // server sends file list as single zstd-compressed blob
 };
 
 // ---- Compress algo ----
@@ -249,15 +254,20 @@ static_assert(sizeof(BlockChecksumEntry) == 12, "BlockChecksumEntry size mismatc
 
 // ---- Virtual Archive structures ----
 
-// ArchiveManifestHdr: 24 bytes
+// ArchiveManifestHdr: 40 bytes
+// dir_id: 16-byte UUID identifying the server's source directory.
+// Generated once per src_dir (stored in src_dir/.fastcp/dir_id) and sent
+// in every manifest so the client can name its progress/cache files after
+// the source directory rather than the server IP:port.
 struct ArchiveManifestHdr {
     u64 total_virtual_size;  // sum of all file sizes in this archive
     u32 total_files;
     u32 chunk_size;          // fixed chunk size in bytes
     u32 total_chunks;
     u8  pad[4];
+    u8  dir_id[16];          // server src_dir UUID (see server_app.cpp load_or_create_dir_id)
 };
-static_assert(sizeof(ArchiveManifestHdr) == 24, "ArchiveManifestHdr size mismatch");
+static_assert(sizeof(ArchiveManifestHdr) == 40, "ArchiveManifestHdr size mismatch");
 
 // ArchiveFileEntry: 48 bytes fixed + path
 struct ArchiveFileEntry {

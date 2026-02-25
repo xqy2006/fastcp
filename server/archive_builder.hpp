@@ -40,6 +40,9 @@ struct VirtualFile {
     std::string abs_path;
 };
 
+// Default memory limit for pre_read_all(): 256 MiB.
+static constexpr u64 PRE_READ_MAX_BYTES = 256ULL * 1024 * 1024;
+
 class ArchiveBuilder {
 public:
     // Build virtual layout from file entries.
@@ -51,8 +54,20 @@ public:
     u64 total_size()  const { return total_size_;  }
     u32 chunk_size()  const { return chunk_size_;  }
 
+    // Pre-read ALL file content into a single in-memory buffer and compute
+    // per-file xxh3_128 hashes in the same pass (one open/read/close per file).
+    //
+    // Returns true if the buffer was successfully populated.  After this call:
+    //   - files_[i].xxh3_128 is set for every file
+    //   - read_chunk() serves data directly from the buffer (no disk I/O)
+    //
+    // Returns false (and leaves state unchanged) if total_size_ exceeds
+    // max_bytes — in that case read_chunk() falls back to MmapReader.
+    bool pre_read_all(u64 max_bytes = PRE_READ_MAX_BYTES);
+
     // Read and assemble raw data for one archive chunk.
-    // Cross-file boundaries are handled by concatenating spans.
+    // If pre_read_all() succeeded, this is a fast in-memory memcpy.
+    // Otherwise falls back to opening each source file individually.
     std::vector<u8> read_chunk(u32 chunk_id) const;
 
 private:
@@ -60,4 +75,7 @@ private:
     std::vector<VirtualChunk> chunks_;
     u64 total_size_{0};
     u32 chunk_size_{0};
+
+    // In-memory buffer populated by pre_read_all(); empty if not called.
+    std::vector<u8> pre_read_buf_;
 };

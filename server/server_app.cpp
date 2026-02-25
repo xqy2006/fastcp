@@ -7,8 +7,10 @@
 #include "../common/protocol_io.hpp"
 #include "../common/file_io.hpp"
 #include "../common/hash.hpp"
+#include "../common/compress.hpp"
 #include "../common/logger.hpp"
 #include "../common/utils.hpp"
+#include "../common/write_buffer.hpp"
 #include <thread>
 #include <algorithm>
 #include <cstring>
@@ -16,6 +18,43 @@
 #include <deque>
 #include <chrono>
 #include <iostream>
+#include <fstream>
+#include <filesystem>
+#include <random>
+
+namespace fs = std::filesystem;
+
+// Load or create a 16-byte UUID for the source directory.
+// Stored in src_dir/.fastcp/dir_id (created on first run).
+// This UUID lets the client distinguish different source directories
+// even when served from the same IP:port.
+static void load_or_create_dir_id(const std::string& src_dir, u8 out[16]) {
+    fs::path fastcp_dir = fs::path(src_dir) / ".fastcp";
+    fs::path id_file    = fastcp_dir / "dir_id";
+
+    // Try to read existing id
+    {
+        std::ifstream f(id_file.string(), std::ios::binary);
+        if (f) {
+            f.read((char*)out, 16);
+            if (f.gcount() == 16) return;
+        }
+    }
+
+    // Generate new random UUID
+    std::random_device rd;
+    std::mt19937_64 gen(rd());
+    std::uniform_int_distribution<u64> dist;
+    u64 a = dist(gen), b = dist(gen);
+    std::memcpy(out,     &a, 8);
+    std::memcpy(out + 8, &b, 8);
+
+    // Persist it
+    std::error_code ec;
+    fs::create_directories(fastcp_dir, ec);
+    std::ofstream f(id_file.string(), std::ios::binary | std::ios::trunc);
+    if (f) f.write((char*)out, 16);
+}
 
 // ============================================================
 // ServerApp
@@ -30,6 +69,10 @@ ServerApp::~ServerApp() {
 }
 
 int ServerApp::run() {
+    // Load (or create) the source-directory UUID so every session can send it
+    // to the client for per-directory temp-file naming.
+    load_or_create_dir_id(config_.src_dir, config_.dir_id);
+
     // Scan source directory: stat-only (no hash computation) so the server
     // starts listening almost immediately regardless of directory size.
     LOG_INFO("Scanning source directory: " + config_.src_dir);
@@ -59,6 +102,14 @@ int ServerApp::run() {
             local = entries_;
         }
         for (auto& fe : local) {
+            // Stop early if a client session has started: phase_transfer_archive
+            // will call pre_read_all() which computes hashes in the same pass as
+            // the file read, making the background hasher redundant and harmful
+            // (it competes for disk I/O with the transfer).
+            if (bg_hasher_stop_.load(std::memory_order_relaxed)) {
+                LOG_INFO("Background hash computation cancelled (transfer started)");
+                return;
+            }
             if (fe.hash_computed) continue;
             if (fe.file_size == 0) {
                 fe.xxh3_128     = hash::xxh3_128(nullptr, 0);
@@ -209,7 +260,7 @@ void ServerApp::connector_thread(TcpSocket sock) {
             sid = generate_session_id();
 
         u16 server_caps = CAP_COMPRESS | CAP_RESUME | CAP_BUNDLE | CAP_DELTA | CAP_VIRTUAL_ARCHIVE
-                        | CAP_CHUNK_RESUME | CAP_PIPELINE_SYNC;
+                        | CAP_CHUNK_RESUME | CAP_PIPELINE_SYNC | CAP_TREE_CACHE | CAP_COMPRESSED_TREE;
             if (!config_.use_compress) server_caps &= ~CAP_COMPRESS;
             agreed_caps       = req.capabilities & server_caps;
             agreed_chunk_size = config_.chunk_size;
@@ -292,6 +343,11 @@ void ServerApp::connector_thread(TcpSocket sock) {
 //   Fires a new ClientSession thread for a fully-assembled session.
 // ---------------------------------------------------------------
 void ServerApp::launch_session(PendingSession ps) {
+    // Stop the background hasher: pre_read_all() in phase_transfer_archive will
+    // compute any missing hashes in the same pass as the file read, making the
+    // background hasher redundant and a source of disk-I/O competition.
+    bg_hasher_stop_.store(true, std::memory_order_relaxed);
+
     // Snapshot current file entries
     std::vector<FileEntry> entries_snap;
     u64 total_bytes_snap;
@@ -434,6 +490,16 @@ int ClientSession::run() {
         if (!phase_pipeline_sync()) {
             LOG_WARN("Pipeline sync completed with some errors");
         }
+    } else if (agreed_caps_ & CAP_VIRTUAL_ARCHIVE) {
+        // VA direct mode: skip file list exchange entirely.
+        // Build an all-FULL plan (client dst is empty or a fresh transfer)
+        // and go straight to the archive manifest + chunk stream.
+        SyncPlanMap plan;
+        for (auto& fe : entries_)
+            plan.plan[fe.file_id] = {SyncAction::FULL, 0};
+        if (!phase_transfer_archive(plan)) {
+            LOG_WARN("Archive transfer completed with some errors");
+        }
     } else {
         SyncPlanMap plan;
         if (!phase_file_list(plan)) {
@@ -441,15 +507,8 @@ int ClientSession::run() {
             tui_->stop();
             return 1;
         }
-
-        if (agreed_caps_ & CAP_VIRTUAL_ARCHIVE) {
-            if (!phase_transfer_archive(plan)) {
-                LOG_WARN("Archive transfer completed with some errors");
-            }
-        } else {
-            if (!phase_transfer(plan)) {
-                LOG_WARN("Transfer completed with some errors");
-            }
+        if (!phase_transfer(plan)) {
+            LOG_WARN("Transfer completed with some errors");
         }
     }
 
@@ -850,6 +909,15 @@ bool ClientSession::phase_transfer_archive(const SyncPlanMap& plan) {
     LOG_INFO("Archive mode: " + std::to_string(archive.files().size()) +
              " files, " + std::to_string(archive.chunks().size()) + " chunks");
 
+    // 2b. Pre-read all file content into memory (one ReadFile/read() per file).
+    //     This also computes per-file xxh3_128 hashes in the same pass so the
+    //     manifest has correct hashes, and makes subsequent read_chunk() calls
+    //     pure in-memory memcpy operations (no further disk I/O).
+    //     Falls back to the original MmapReader path for archives > 256 MiB.
+    if (!archive.pre_read_all()) {
+        LOG_INFO("Archive too large for in-memory mode — using MmapReader per chunk");
+    }
+
     TcpSocket& sock0 = pool_.get(0);
 
     // 3. Send manifest on conn[0]
@@ -859,34 +927,39 @@ bool ClientSession::phase_transfer_archive(const SyncPlanMap& plan) {
         hdr_msg.total_files        = (u32)archive.files().size();
         hdr_msg.chunk_size         = archive.chunk_size();
         hdr_msg.total_chunks       = (u32)archive.chunks().size();
+        std::memcpy(hdr_msg.dir_id, cfg_.dir_id, 16);
         ArchiveManifestHdr encoded = hdr_msg;
         proto::encode_archive_manifest_hdr(encoded);
         sock0.write_frame(MsgType::MT_ARCHIVE_MANIFEST_HDR, 0,
                           &encoded, sizeof(encoded));
     }
 
-    for (const auto& vf : archive.files()) {
-        std::vector<u8> payload(sizeof(ArchiveFileEntry) + vf.rel_path.size());
-        ArchiveFileEntry fe_msg{};
-        fe_msg.file_id        = vf.file_id;
-        fe_msg.virtual_offset = vf.virtual_offset;
-        fe_msg.file_size      = vf.file_size;
-        fe_msg.mtime_ns       = vf.mtime_ns;
-        fe_msg.path_len       = (u16)vf.rel_path.size();
-        fe_msg.flags          = 0;
-        hash::to_bytes(vf.xxh3_128, fe_msg.xxh3_128);
-
-        ArchiveFileEntry encoded = fe_msg;
-        proto::encode_archive_file_entry(encoded);
-        std::memcpy(payload.data(), &encoded, sizeof(ArchiveFileEntry));
-        std::memcpy(payload.data() + sizeof(ArchiveFileEntry),
-                    vf.rel_path.data(), vf.rel_path.size());
-
-        sock0.write_frame(MsgType::MT_ARCHIVE_FILE_ENTRY, 0,
-                          payload.data(), (u32)payload.size());
+    // Send all file entries coalesced into a few large TCP writes.
+    // Without TcpWriteBuffer, 10 000 entries = 10 000 write() syscalls
+    // (~300 ms on loopback with TCP_NODELAY); with it, ~5 writes.
+    {
+        TcpWriteBuffer wbuf(sock0);
+        for (const auto& vf : archive.files()) {
+            std::vector<u8> payload(sizeof(ArchiveFileEntry) + vf.rel_path.size());
+            ArchiveFileEntry fe_msg{};
+            fe_msg.file_id        = vf.file_id;
+            fe_msg.virtual_offset = vf.virtual_offset;
+            fe_msg.file_size      = vf.file_size;
+            fe_msg.mtime_ns       = vf.mtime_ns;
+            fe_msg.path_len       = (u16)vf.rel_path.size();
+            fe_msg.flags          = 0;
+            hash::to_bytes(vf.xxh3_128, fe_msg.xxh3_128);
+            ArchiveFileEntry encoded = fe_msg;
+            proto::encode_archive_file_entry(encoded);
+            std::memcpy(payload.data(), &encoded, sizeof(ArchiveFileEntry));
+            std::memcpy(payload.data() + sizeof(ArchiveFileEntry),
+                        vf.rel_path.data(), vf.rel_path.size());
+            wbuf.write_frame(MsgType::MT_ARCHIVE_FILE_ENTRY, 0,
+                             payload.data(), (u32)payload.size());
+        }
+        wbuf.write_frame(MsgType::MT_ARCHIVE_MANIFEST_END, 0, nullptr, 0);
+        // destructor flushes all buffered data in one/two send() calls
     }
-
-    sock0.write_frame(MsgType::MT_ARCHIVE_MANIFEST_END, 0, nullptr, 0);
 
     // 4. Receive CHUNK_REQUEST from client (conn[0])
     FrameHeader req_hdr{};
@@ -964,6 +1037,31 @@ bool ClientSession::phase_transfer_archive(const SyncPlanMap& plan) {
 
 
 
+// Compute a stable 128-bit token over the file tree: xxh3-128 of sorted
+// (rel_path + mtime_ns + file_size) for every entry. Used by CAP_TREE_CACHE.
+static hash::Hash128 compute_tree_token(const std::vector<FileEntry>& entries) {
+    std::vector<const FileEntry*> sorted;
+    sorted.reserve(entries.size());
+    for (const auto& fe : entries) sorted.push_back(&fe);
+    std::sort(sorted.begin(), sorted.end(),
+              [](const FileEntry* a, const FileEntry* b) {
+                  return a->rel_path < b->rel_path;
+              });
+
+    std::vector<u8> buf;
+    buf.reserve(sorted.size() * 32);
+    for (const FileEntry* fe : sorted) {
+        buf.insert(buf.end(), fe->rel_path.begin(), fe->rel_path.end());
+        u64 mt = fe->mtime_ns;
+        u64 sz = fe->file_size;
+        const u8* mp = reinterpret_cast<const u8*>(&mt);
+        const u8* sp = reinterpret_cast<const u8*>(&sz);
+        buf.insert(buf.end(), mp, mp + 8);
+        buf.insert(buf.end(), sp, sp + 8);
+    }
+    return hash::xxh3_128(buf.data(), buf.size());
+}
+
 bool ClientSession::phase_pipeline_sync() {
     int num_conns = pool_.size();
     TcpSocket& conn0 = pool_.get(0);
@@ -973,55 +1071,13 @@ bool ClientSession::phase_pipeline_sync() {
     file_map.reserve(entries_.size());
     for (auto& fe : entries_) file_map[fe.file_id] = &fe;
 
-    // ---- Step 1: Stream file tree to client on conn[0] ----
-    // Reuse the FILE_LIST_ENTRY wire format (path, size, mtime, hash).
-    // Hash is computed lazily; a zero hash tells the client to fall back to
-    // mtime-only comparison for that entry.
-    conn0.write_frame(MsgType::MT_FILE_LIST_BEGIN, 0, nullptr, 0);
-
-    for (auto& fe : entries_) {
-        // Lazy hash computation (same pattern as phase_file_list)
-        if (!fe.hash_computed) {
-            if (fe.file_size == 0) {
-                fe.xxh3_128      = hash::xxh3_128(nullptr, 0);
-                fe.hash_computed = true;
-            } else {
-                try {
-                    file_io::MmapReader reader(fe.abs_path);
-                    fe.xxh3_128      = hash::xxh3_128(reader.data(), (size_t)reader.size());
-                    fe.hash_computed = true;
-                } catch (const std::exception& e) {
-                    LOG_WARN("phase_pipeline_sync: cannot hash " +
-                             fe.abs_path + ": " + e.what());
-                }
-            }
-        }
-
-        FileListEntry fle{};
-        fle.file_id   = fe.file_id;
-        fle.file_size = fe.file_size;
-        fle.mtime_ns  = fe.mtime_ns;
-        fle.path_len  = (u16)fe.rel_path.size();
-        fle.flags     = 0;
-        hash::to_bytes(fe.xxh3_128, fle.xxh3_128);
-
-        std::vector<u8> payload(sizeof(FileListEntry) + fe.rel_path.size());
-        FileListEntry encoded = fle;
-        proto::encode_file_list_entry(encoded);
-        std::memcpy(payload.data(), &encoded, sizeof(FileListEntry));
-        std::memcpy(payload.data() + sizeof(FileListEntry),
-                    fe.rel_path.data(), fe.rel_path.size());
-
-        conn0.write_frame(MsgType::MT_FILE_LIST_ENTRY, 0,
-                          payload.data(), (u32)payload.size());
-    }
-    conn0.write_frame(MsgType::MT_FILE_LIST_END, 0, nullptr, 0);
-
-    LOG_INFO("Pipeline: sent file tree (" +
-             std::to_string(entries_.size()) + " entries)");
-
-    // ---- Step 2: Set up file dispatch ----
-    // Pipeline mode does not exchange delta-sync block checksums; use empty maps.
+    // ---- Create FileSender early and start parallel small-file pre-read ----
+    // We do this BEFORE streaming the file list so that the pre-read overlaps
+    // with FILE_LIST_ENTRY transmission and the subsequent WANT_FILE wait.
+    // On Docker overlayfs, open()+read()+close() per file costs ~0.7 ms each;
+    // 10 000 files × 0.7 ms = 7 s if done serially at send time.
+    // With 8 parallel readers running while the network is busy, the overhead
+    // is hidden behind the ~150–200 ms the client needs to process the list.
     FileSender sender(pool_, tui_state_, cfg_.use_compress, agreed_chunk_size_,
                       empty_delta_checksums(), empty_delta_block_sizes());
     if (agreed_caps_ & CAP_CHUNK_RESUME) {
@@ -1031,14 +1087,132 @@ bool ClientSession::phase_pipeline_sync() {
         sender.set_max_chunks(cfg_.max_chunks);
     }
 
-    std::mutex          want_mutex;
-    std::deque<u32>     want_queue;          // file_ids the client requested
-    std::atomic<bool>   check_done{false};   // set when MT_FILE_CHECK_DONE is received
-    std::atomic<int>    round_robin{0};      // round-robin counter for data conns
+    // Collect candidate small files for background pre-read.
+    // The thread is only started after we know it's a tree MISS (below),
+    // so a tree cache HIT incurs zero wasted disk I/O.
+    std::vector<const FileEntry*> preread_files;
+    for (auto& fe : entries_) {
+        if (fe.is_small) preread_files.push_back(&fe);
+    }
+    std::thread preread_th;  // started conditionally after HIT/MISS decision
 
-    // dispatch_file: find the FileEntry and send it on a data connection.
-    // Returns false if the chunk limit was reached (test mode), true otherwise.
-    auto dispatch_file = [&](u32 fid) -> bool {
+    // ---- Step 1: Stream file tree to client on conn[0] ----
+    // FIX 3: When CAP_TREE_CACHE is negotiated, embed the 16-byte tree_token
+    // in the FILE_LIST_BEGIN payload. Then wait for the client to reply with
+    // either MT_TREE_CACHE_HIT (skip sending entries) or MT_TREE_CACHE_MISS
+    // (send entries as usual). This saves ~540 KB per incremental run when
+    // nothing has changed.
+    bool use_tree_cache = (agreed_caps_ & CAP_TREE_CACHE) != 0;
+    bool tree_hit = false;
+
+    if (use_tree_cache) {
+        hash::Hash128 token = compute_tree_token(entries_);
+        u8 token_bytes[16];
+        hash::to_bytes(token, token_bytes);
+        // Payload: [tree_token(16)][dir_id(16)] = 32 bytes
+        u8 begin_payload[32];
+        std::memcpy(begin_payload,      token_bytes,    16);
+        std::memcpy(begin_payload + 16, cfg_.dir_id,    16);
+        conn0.write_frame(MsgType::MT_FILE_LIST_BEGIN, 0, begin_payload, 32);
+
+        // Wait for client's cache decision (HIT → skip entries, MISS → send them)
+        FrameHeader resp_hdr{}; std::vector<u8> resp_pl;
+        if (conn0.read_frame(resp_hdr, resp_pl)) {
+            tree_hit = ((MsgType)resp_hdr.msg_type == MsgType::MT_TREE_CACHE_HIT);
+        }
+    } else {
+        conn0.write_frame(MsgType::MT_FILE_LIST_BEGIN, 0, nullptr, 0);
+    }
+
+    if (!tree_hit) {
+        // Start small-file pre-read in the background so it overlaps with the
+        // FILE_LIST_ENTRY transmission below (~37 ms @ 100 mbit for 10k files)
+        // and the subsequent WANT_FILE wait (~150 ms).  On Docker overlayfs
+        // each open() costs ~40 µs; 8 threads reduce 10k files from ~400 ms
+        // serial to ~55 ms parallel — hidden behind the network wait.
+        if (!preread_files.empty()) {
+            preread_th = std::thread([&]() {
+                sender.prefill_small_cache(preread_files, 8);
+            });
+        }
+
+        // Build the raw file-list blob (same layout as before: FileListEntry + path per file).
+        // If CAP_COMPRESSED_TREE is agreed, compress the whole blob with zstd and send it
+        // as a single MT_FILE_LIST_COMPRESSED frame (4-byte LE original_size prefix + zstd data).
+        // This reduces 10 000-file list from ~520 KB to ~30-50 KB, saving ~8 s at 500 kbit.
+        // Fallback: send individual MT_FILE_LIST_ENTRY frames as before.
+        {
+            // Serialise all entries into a flat buffer
+            std::vector<u8> raw;
+            raw.reserve(entries_.size() * 52);
+            for (auto& fe : entries_) {
+                FileListEntry fle{};
+                fle.file_id   = fe.file_id;
+                fle.file_size = fe.file_size;
+                fle.mtime_ns  = fe.mtime_ns;
+                fle.path_len  = (u16)fe.rel_path.size();
+                fle.flags     = 0;
+                if (fe.hash_computed)
+                    hash::to_bytes(fe.xxh3_128, fle.xxh3_128);
+                else
+                    std::memset(fle.xxh3_128, 0, 16);
+                FileListEntry encoded = fle;
+                proto::encode_file_list_entry(encoded);
+                const u8* ep = reinterpret_cast<const u8*>(&encoded);
+                raw.insert(raw.end(), ep, ep + sizeof(FileListEntry));
+                raw.insert(raw.end(), fe.rel_path.begin(), fe.rel_path.end());
+            }
+
+            bool use_compressed_tree = (agreed_caps_ & CAP_COMPRESSED_TREE) != 0;
+            if (use_compressed_tree && !raw.empty()) {
+                // Compress: prepend 4-byte LE original size so client can pre-allocate
+                std::vector<u8> cdata = compress::compress_to_vec(raw.data(), raw.size());
+                u32 orig_size = (u32)raw.size();
+                std::vector<u8> payload(4 + cdata.size());
+                std::memcpy(payload.data(), &orig_size, 4);  // little-endian on all targets
+                std::memcpy(payload.data() + 4, cdata.data(), cdata.size());
+                conn0.write_frame(MsgType::MT_FILE_LIST_COMPRESSED, 0,
+                                  payload.data(), (u32)payload.size());
+                LOG_INFO("Pipeline: sent compressed file tree (" +
+                         std::to_string(entries_.size()) + " entries, " +
+                         std::to_string(raw.size()) + " → " +
+                         std::to_string(cdata.size()) + " bytes)");
+            } else {
+                // Legacy: individual frames + END
+                TcpWriteBuffer wbuf(conn0);
+                size_t off = 0;
+                for (auto& fe : entries_) {
+                    size_t entry_size = sizeof(FileListEntry) + fe.rel_path.size();
+                    wbuf.write_frame(MsgType::MT_FILE_LIST_ENTRY, 0,
+                                     raw.data() + off, (u32)entry_size);
+                    off += entry_size;
+                }
+                wbuf.write_frame(MsgType::MT_FILE_LIST_END, 0, nullptr, 0);
+                LOG_INFO("Pipeline: sent file tree (" +
+                         std::to_string(entries_.size()) + " entries)");
+            }
+        }
+    } else {
+        LOG_INFO("Pipeline: tree cache HIT, skipped " +
+                 std::to_string(entries_.size()) + " entries");
+    }
+
+    // ---- Step 2: Set up file dispatch ----
+    // (FileSender was created above to allow early pre-read overlap)
+
+    std::mutex                     want_mutex;
+    std::condition_variable        want_cv;
+    std::deque<u32>                want_queue;
+    std::atomic<bool>              check_done{false};
+    std::atomic<int>               round_robin{0};
+
+    // FIX 2: small files are accumulated here and batch-sent after FILE_CHECK_DONE,
+    // avoiding 1 bundle-message per file (1000 files → 1000 round-trips).
+    std::vector<const FileEntry*>  pending_small;
+
+    // dispatch_one: large files are sent immediately; small files are queued for
+    // batch sending. Returns false only if the test-mode chunk limit is reached.
+    auto dispatch_one = [&](u32 fid) -> bool {
         auto it = file_map.find(fid);
         if (it == file_map.end()) {
             LOG_WARN("Pipeline dispatch: unknown file_id=" + std::to_string(fid));
@@ -1046,7 +1220,12 @@ bool ClientSession::phase_pipeline_sync() {
         }
         const FileEntry& fe = *it->second;
 
-        // Use conn[1..N-1] when available; fall back to conn[0] for single-conn sessions
+        if (fe.is_small) {
+            pending_small.push_back(&fe);
+            return true;
+        }
+
+        // Large file: dispatch immediately on a data connection
         int ci;
         if (num_conns > 1) {
             int v = round_robin.fetch_add(1);
@@ -1056,15 +1235,10 @@ bool ClientSession::phase_pipeline_sync() {
         }
 
         try {
-            if (fe.is_small) {
-                sender.send_bundle({&fe}, ci);
-            } else {
-                sender.init_file_tracking(fe.file_id, 1);
-                sender.send_large_file(fe, /*resume_offset=*/0, ci);
-            }
+            sender.init_file_tracking(fe.file_id, 1);
+            sender.send_large_file(fe, /*resume_offset=*/0, ci);
             tui_state_.files_done.fetch_add(1);
         } catch (const std::runtime_error& e) {
-            // Test-mode chunk limit reached: stop dispatching gracefully
             LOG_WARN("Pipeline dispatch stopped: " + std::string(e.what()));
             check_done.store(true);
             return false;
@@ -1072,20 +1246,64 @@ bool ClientSession::phase_pipeline_sync() {
         return true;
     };
 
-    // drain_queue_mt: pop all pending file_ids and dispatch them (thread-safe).
-    // Stops early if dispatch_file signals chunk limit reached.
-    auto drain_queue_mt = [&]() {
+    auto drain_queue = [&]() {
         std::deque<u32> local;
         {
             std::lock_guard<std::mutex> lk(want_mutex);
             local.swap(want_queue);
         }
         for (u32 fid : local) {
-            if (!dispatch_file(fid)) break; // chunk limit reached
+            if (!dispatch_one(fid)) break;
         }
     };
 
-    // ---- N=1 fast path: must finish reading before sending (single connection) ----
+    // batch_send_small: split pending_small across data connections, one
+    // send_bundle call per connection (respects MAX_BUNDLE_SIZE / MAX_BUNDLE_FILES).
+    auto batch_send_small = [&]() {
+        // Wait for the pre-read thread to finish before accessing the cache.
+        // By the time FILE_CHECK_DONE arrives the pre-read is almost always
+        // already complete (it ran in parallel with FILE_LIST_ENTRY + WANT_FILE).
+        if (preread_th.joinable()) preread_th.join();
+
+        if (pending_small.empty()) return;
+        int num_data = (num_conns > 1) ? (num_conns - 1) : 1;
+
+        // Partition files round-robin across data connections
+        std::vector<std::vector<const FileEntry*>> batches((size_t)num_data);
+        for (size_t i = 0; i < pending_small.size(); ++i)
+            batches[i % (size_t)num_data].push_back(pending_small[i]);
+
+        for (int d = 0; d < num_data; ++d) {
+            if (batches[(size_t)d].empty()) continue;
+            int ci = (num_conns > 1) ? (1 + d) : 0;
+
+            // Send in MAX_BUNDLE_SIZE slices if the batch is very large
+            const auto& batch = batches[(size_t)d];
+            size_t start = 0;
+            while (start < batch.size()) {
+                std::vector<const FileEntry*> sub;
+                u64 sub_bytes = 0;
+                while (start < batch.size() &&
+                       sub.size() < MAX_BUNDLE_FILES &&
+                       sub_bytes + batch[start]->file_size <= MAX_BUNDLE_SIZE) {
+                    sub_bytes += batch[start]->file_size;
+                    sub.push_back(batch[start]);
+                    ++start;
+                }
+                if (sub.empty()) { ++start; continue; } // 0-size file edge case
+                try {
+                    sender.send_bundle(sub, ci);
+                    tui_state_.files_done.fetch_add((u32)sub.size());
+                } catch (const std::exception& e) {
+                    LOG_WARN("Batch bundle failed: " + std::string(e.what()));
+                }
+            }
+        }
+        LOG_INFO("Pipeline: batch-sent " + std::to_string(pending_small.size()) +
+                 " small files");
+    };
+
+    // ---- N=1 fast path: single connection, must read all WANT_FILE before sending ----
     if (num_conns == 1) {
         std::vector<u32> want_list;
         for (;;) {
@@ -1102,23 +1320,32 @@ bool ClientSession::phase_pipeline_sync() {
             }
         }
         for (u32 fid : want_list) {
-            if (!dispatch_file(fid)) break; // chunk limit reached
+            if (!dispatch_one(fid)) break;
         }
+        batch_send_small();
         return true;
     }
 
-    // ---- N>1: time-based dispatcher running in parallel with WANT_FILE reader ----
-    // Dispatcher thread: every 100 ms pop from want_queue and send on conn[1..N-1].
+    // ---- N>1: CV-based dispatcher runs in parallel with the WANT_FILE reader ----
+    // FIX 1: replaced the old sleep_for(100ms) polling with a condition_variable
+    // that wakes the dispatcher immediately whenever a WANT_FILE is enqueued.
     std::thread dispatcher([&]() {
-        using ms = std::chrono::milliseconds;
-        while (!check_done.load()) {
-            std::this_thread::sleep_for(ms(100));
-            drain_queue_mt();
+        while (true) {
+            {
+                std::unique_lock<std::mutex> lk(want_mutex);
+                want_cv.wait(lk, [&]{ return !want_queue.empty() || check_done.load(); });
+            }
+            drain_queue();
+            if (check_done.load()) break;
         }
-        drain_queue_mt(); // final flush after FILE_CHECK_DONE
+        drain_queue(); // catch any items that arrived with FILE_CHECK_DONE
+
+        // FIX 2: all small files collected during the WANT_FILE phase are now
+        // batch-sent — one bundle per data connection instead of 1000 individual bundles.
+        batch_send_small();
     });
 
-    // Main thread: read WANT_FILE messages until FILE_CHECK_DONE
+    // Main thread: read WANT_FILE messages on conn[0] until FILE_CHECK_DONE
     for (;;) {
         FrameHeader hdr{}; std::vector<u8> pl;
         if (!conn0.read_frame(hdr, pl)) break;
@@ -1133,11 +1360,17 @@ bool ClientSession::phase_pipeline_sync() {
                 std::lock_guard<std::mutex> lk(want_mutex);
                 want_queue.push_back(wmsg.file_id);
             }
+            want_cv.notify_one(); // FIX 1: wake dispatcher immediately
         }
     }
 
     check_done.store(true);
+    want_cv.notify_all(); // wake dispatcher for final drain
     dispatcher.join();
+
+    // Safety: ensure preread thread is joined even if batch_send_small
+    // was never called (e.g. no small files were WANT_FILEd).
+    if (preread_th.joinable()) preread_th.join();
 
     LOG_INFO("Pipeline: all requested files dispatched");
     return true;

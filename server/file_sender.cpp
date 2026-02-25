@@ -8,10 +8,16 @@
 #include "../common/hash.hpp"
 #include "../common/file_io.hpp"
 #include "../common/logger.hpp"
+#include "../common/write_buffer.hpp"
 #include "../common/utils.hpp"
 #include <cstring>
 #include <vector>
 #include <mutex>
+#include <atomic>
+#ifndef _WIN32
+#  include <fcntl.h>
+#  include <unistd.h>
+#endif
 #include <condition_variable>
 
 FileSender::FileSender(ConnectionPool& pool,
@@ -375,6 +381,79 @@ bool FileSender::send_large_file_parallel(
 
 // ---- Bundle ----
 
+// Parallel pre-read of small files into memory.
+//
+// Uses direct open/read/close syscalls (3 per file) instead of
+// std::ifstream (which needs 5: open+seekg_end+tellg+seekg_beg+read).
+// Since FileEntry already has the file size, we can skip the stat/seek.
+// With 8 threads, this parallelises the per-file open() latency that is
+// especially high on Docker overlayfs (~40 µs per file, 400 ms serial for
+// 10 000 files → ~55 ms with 8 threads).
+//
+// After all workers finish the cache is read-only, so send_bundle() reads
+// it without a lock.
+void FileSender::prefill_small_cache(const std::vector<const FileEntry*>& files,
+                                      int num_threads)
+{
+    if (files.empty()) return;
+
+    std::mutex cache_mutex;
+    std::atomic<size_t> next_idx{0};
+
+    auto worker = [&]() {
+        for (;;) {
+            size_t i = next_idx.fetch_add(1, std::memory_order_relaxed);
+            if (i >= files.size()) break;
+            const FileEntry* fe = files[i];
+
+            if (fe->file_size == 0) {
+                std::lock_guard<std::mutex> lk(cache_mutex);
+                small_file_cache_[fe->file_id] = {};
+                continue;
+            }
+
+            std::vector<u8> buf((size_t)fe->file_size);
+            bool ok = false;
+
+#ifdef _WIN32
+            HANDLE h = CreateFileA(fe->abs_path.c_str(),
+                                   GENERIC_READ, FILE_SHARE_READ,
+                                   nullptr, OPEN_EXISTING,
+                                   FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (h != INVALID_HANDLE_VALUE) {
+                DWORD n = 0;
+                if (ReadFile(h, buf.data(), (DWORD)fe->file_size, &n, nullptr) &&
+                    n == (DWORD)fe->file_size)
+                    ok = true;
+                CloseHandle(h);
+            }
+#else
+            // 3 syscalls: open + read + close (no stat needed, size from FileEntry)
+            int fd = ::open(fe->abs_path.c_str(), O_RDONLY);
+            if (fd >= 0) {
+                ssize_t n = ::read(fd, buf.data(), (size_t)fe->file_size);
+                if (n == (ssize_t)fe->file_size) ok = true;
+                ::close(fd);
+            }
+#endif
+            if (ok) {
+                std::lock_guard<std::mutex> lk(cache_mutex);
+                small_file_cache_[fe->file_id] = std::move(buf);
+            }
+        }
+    };
+
+    int n = std::min(num_threads, (int)files.size());
+    std::vector<std::thread> workers;
+    workers.reserve((size_t)n);
+    for (int i = 0; i < n; ++i) workers.emplace_back(worker);
+    for (auto& w : workers) w.join();
+}
+
+void FileSender::clear_small_cache() {
+    small_file_cache_.clear();
+}
+
 bool FileSender::send_bundle(const std::vector<const FileEntry*>& files, int conn_idx) {
     if (files.empty()) return true;
 
@@ -391,21 +470,34 @@ bool FileSender::send_bundle(const std::vector<const FileEntry*>& files, int con
     bb.pad[0] = bb.pad[1] = 0;
     bb.total_size  = total_size;
     proto::encode_bundle_begin(bb);
-    sock.write_frame(MsgType::MT_BUNDLE_BEGIN, 0, &bb, sizeof(bb));
+
+    // Use a write buffer: coalesces BUNDLE_BEGIN + N×BUNDLE_ENTRY + BUNDLE_END
+    // into a few large send() calls instead of N+2 individual write() syscalls.
+    TcpWriteBuffer wbuf(sock);
+    wbuf.write_frame(MsgType::MT_BUNDLE_BEGIN, 0, &bb, sizeof(bb));
 
     bool all_ok = true;
     for (auto* fe : files) {
-        // Read file
+        // Resolve file content: prefer pre-read cache (no open/mmap overhead),
+        // fall back to MmapReader when the cache wasn't populated.
+        const u8* file_data = nullptr;
         std::unique_ptr<file_io::MmapReader> reader;
-        try {
-            reader = std::make_unique<file_io::MmapReader>(fe->abs_path);
-        } catch (const std::exception& e) {
-            Logger::get().transfer_error("Cannot read " + fe->abs_path + ": " + e.what());
-            all_ok = false;
-            continue;
+
+        auto cache_it = small_file_cache_.find(fe->file_id);
+        if (cache_it != small_file_cache_.end()) {
+            file_data = cache_it->second.empty() ? nullptr : cache_it->second.data();
+        } else if (fe->file_size > 0) {
+            try {
+                reader = std::make_unique<file_io::MmapReader>(fe->abs_path);
+                file_data = (const u8*)reader->data();
+            } catch (const std::exception& e) {
+                Logger::get().transfer_error("Cannot read " + fe->abs_path + ": " + e.what());
+                all_ok = false;
+                continue;
+            }
         }
 
-        // Send BUNDLE_ENTRY_HDR + path + data
+        // Build BUNDLE_ENTRY_HDR + path + data into one payload, then buffer it
         BundleEntryHdr entry{};
         entry.file_id   = fe->file_id;
         entry.file_size = fe->file_size;
@@ -419,17 +511,18 @@ bool FileSender::send_bundle(const std::vector<const FileEntry*>& files, int con
         std::memcpy(payload.data(), &encoded, sizeof(BundleEntryHdr));
         std::memcpy(payload.data() + sizeof(BundleEntryHdr),
                     fe->rel_path.data(), fe->rel_path.size());
-        if (fe->file_size > 0) {
+        if (fe->file_size > 0 && file_data) {
             std::memcpy(payload.data() + sizeof(BundleEntryHdr) + fe->rel_path.size(),
-                        reader->data(), fe->file_size);
+                        file_data, fe->file_size);
         }
 
-        sock.write_frame(MsgType::MT_BUNDLE_ENTRY, 0, payload.data(), (u32)payload.size());
+        wbuf.write_frame(MsgType::MT_BUNDLE_ENTRY, 0, payload.data(), (u32)payload.size());
         tui_state_.bytes_sent.fetch_add(fe->file_size);
     }
 
-    // Send BUNDLE_END
-    sock.write_frame(MsgType::MT_BUNDLE_END, 0, nullptr, 0);
+    // BUNDLE_END then explicit flush (destructor also guards)
+    wbuf.write_frame(MsgType::MT_BUNDLE_END, 0, nullptr, 0);
+    wbuf.flush();
 
     return all_ok;
 }

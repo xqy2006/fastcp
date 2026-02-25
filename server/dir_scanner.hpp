@@ -87,6 +87,11 @@ public:
     u32 total_files() const { return file_count_.load(); }
     u64 total_bytes() const { return total_bytes_.load(); }
 
+    // Compute a 128-bit token over the sorted (path + mtime + size) of all entries.
+    // Used for CAP_TREE_CACHE: if the token matches the client's cached token the
+    // client can skip receiving the full file list.
+    hash::Hash128 tree_token() const;
+
 private:
     std::string src_dir_;
     std::atomic<bool> done_{false};

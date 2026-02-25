@@ -131,6 +131,11 @@ inline bool equal(const Hash128& a, const Hash128& b) {
     return a == b;
 }
 
+// Check if a Hash128 is all-zero (indicates "not yet computed")
+inline bool is_zero(const Hash128& h) {
+    return h == Hash128{};
+}
+
 // Convert Hash128 to raw bytes (copy to 16-byte array)
 inline void to_bytes(const Hash128& h, u8 out[16]) {
     std::copy(h.begin(), h.end(), out);

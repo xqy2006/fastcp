@@ -280,6 +280,7 @@ inline void encode_archive_manifest_hdr(ArchiveManifestHdr& h) {
     h.total_files        = hton32(h.total_files);
     h.chunk_size         = hton32(h.chunk_size);
     h.total_chunks       = hton32(h.total_chunks);
+    // dir_id is a raw byte array — no byte-order conversion needed
 }
 
 inline void decode_archive_manifest_hdr(ArchiveManifestHdr& h) {
@@ -287,6 +288,7 @@ inline void decode_archive_manifest_hdr(ArchiveManifestHdr& h) {
     h.total_files        = ntoh32(h.total_files);
     h.chunk_size         = ntoh32(h.chunk_size);
     h.total_chunks       = ntoh32(h.total_chunks);
+    // dir_id is a raw byte array — no byte-order conversion needed
 }
 
 inline void encode_archive_file_entry(ArchiveFileEntry& e) {

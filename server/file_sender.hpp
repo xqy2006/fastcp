@@ -69,6 +69,16 @@ public:
     // Bundle multiple small files and send on one connection
     bool send_bundle(const std::vector<const FileEntry*>& files, int conn_idx = 0);
 
+    // Pre-read small files into memory using parallel threads, avoiding
+    // per-file open/mmap/close overhead on high-latency filesystems (e.g. Docker
+    // overlayfs). Run this from a background thread while the main thread is
+    // sending the file-list or waiting for WANT_FILE messages.
+    // send_bundle() will use the cache when available.
+    // MUST complete (join the caller's thread) before any send_bundle() call.
+    void prefill_small_cache(const std::vector<const FileEntry*>& files,
+                             int num_threads = 8);
+    void clear_small_cache();
+
     // ---- Parallel API ----
 
     // Send a large file using multiple connections in parallel.
@@ -124,6 +134,11 @@ private:
     std::mutex retry_mutex_;
     std::vector<ChunkRetry> pending_retries_;
     std::atomic<int> nack_errors_{0};
+
+    // Small file content cache populated by prefill_small_cache().
+    // send_bundle() reads this WITHOUT a lock; prefill must be fully
+    // complete (caller's thread joined) before any send_bundle() call.
+    std::unordered_map<u32, std::vector<u8>> small_file_cache_;
 
     // For parallel file sending: track completion status
     std::mutex file_completion_mutex_;

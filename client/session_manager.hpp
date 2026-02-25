@@ -62,6 +62,16 @@ struct SessionInfo {
     std::condition_variable archive_receiver_cv;
     std::atomic<int> archive_done_count{0};
 
+    // CAP_TREE_CACHE: loaded from dst_dir/.fastcp/<name> before pipeline sync.
+    // Populated by conn[0] in handle_pipeline_file_tree(); reused by conn[1..N-1].
+    u8   cached_tree_token[16]{};
+    bool have_tree_cache{false};
+
+    // Server source-directory UUID (received in FILE_LIST_BEGIN or ArchiveManifestHdr).
+    // Used to name per-server temp files under dst/.fastcp/ so that different
+    // source directories on the same server don't share state.
+    u8   dir_id[16]{};
+
     // Stats
     std::atomic<u64> bytes_received{0};
     std::atomic<u32> files_done{0};

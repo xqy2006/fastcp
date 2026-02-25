@@ -17,6 +17,7 @@
 #  include <unistd.h>
 #  include <utime.h>
 #  include <time.h>
+#  include <sys/time.h>
 #endif
 
 namespace fs = std::filesystem;
@@ -215,16 +216,25 @@ void MmapWriter::close(u64 mtime_ns) {
     }
 #else
     if (data_ && size_ > 0) {
-        msync(data_, (size_t)size_, MS_SYNC);
+        // MS_ASYNC: let the kernel writeback in the background.
+        // MS_SYNC would block until all dirty pages are flushed to disk —
+        // on overlayfs with 10 000 small files this adds ~0.5 ms per file.
+        msync(data_, (size_t)size_, MS_ASYNC);
         munmap(data_, (size_t)size_);
         data_ = nullptr;
     }
     if (fd_ >= 0) {
+        if (mtime_ns > 0) {
+            // futimens on the still-open fd: no path lookup, works on overlayfs.
+            // Must be called BEFORE close() — after close() the fd is invalid.
+            struct timespec ts[2];
+            ts[0].tv_sec  = (time_t)(mtime_ns / 1000000000ULL);
+            ts[0].tv_nsec = (long)(mtime_ns % 1000000000ULL);
+            ts[1] = ts[0];
+            ::futimens(fd_, ts);
+        }
         ::close(fd_);
         fd_ = -1;
-    }
-    if (mtime_ns > 0 && !path_.empty()) {
-        set_mtime(path_, mtime_ns);
     }
 #endif
     size_ = 0;
