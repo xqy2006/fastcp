@@ -906,16 +906,6 @@ bool ConnectionHandler::handle_pipeline_file_tree() {
 
         session_->files_total.store((u32)session_->file_list.size());
 
-        // Save tree cache after receiving the full list
-        if (session_->have_tree_cache) {
-            save_tree_cache(session_->root_dir,
-                            session_->dir_id,
-                            session_->cached_tree_token,
-                            session_->file_list);
-            LOG_INFO("Pipeline: tree cache saved (" +
-                     std::to_string(session_->file_list.size()) + " entries)");
-        }
-
         // Signal secondary connections that they may enter handle_transfer_loop()
         {
             std::lock_guard<std::mutex> lk(session_->file_list_mutex);
@@ -928,6 +918,16 @@ bool ConnectionHandler::handle_pipeline_file_tree() {
 
         // Wait for dst scan to finish (it ran in parallel with file list receive)
         dst_scanner.join();
+
+        // Save tree cache after dst scan completes (avoid concurrent overlayfs I/O)
+        if (session_->have_tree_cache) {
+            save_tree_cache(session_->root_dir,
+                            session_->dir_id,
+                            session_->cached_tree_token,
+                            session_->file_list);
+            LOG_INFO("Pipeline: tree cache saved (" +
+                     std::to_string(session_->file_list.size()) + " entries)");
+        }
 
         // ---- Step 2 (cache miss path): use dst_map for O(1) lookup ----
         struct LocalInfo { u64 size; u64 mtime_ns; bool exists; };

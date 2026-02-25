@@ -20,71 +20,24 @@
 namespace fs = std::filesystem;
 
 // ---------------------------------------------------------------
-// first_synced_file_exists
-//   Check if the first file from the previous sync's tree cache
-//   still exists in root_dir. This is the canonical way to decide
-//   whether the destination has been synced before:
-//     - No tree cache → never synced → use Virtual Archive (full)
-//     - First file missing → files not present → use Virtual Archive
-//     - First file exists → destination was previously synced → Pipeline Sync
-//
-// The server scans directories in a deterministic order; the tree
-// cache stores that same order. If the first file is present, it is
-// very likely the destination is in a partially-to-fully synced state
-// and incremental Pipeline Sync is the right choice.
+// has_tree_cache
+//   Check if a previous sync left a tree cache in dst/.fastcp/.
+//   If so, use Pipeline Sync (incremental) — the sync itself will
+//   detect missing/changed files via mtime+size comparison and
+//   request only what's needed.  No need to verify individual files
+//   exist; that's Pipeline Sync's job.
 // ---------------------------------------------------------------
-static bool first_synced_file_exists(const std::string& root) {
-    // Search for any treecache file under dst/.fastcp/
+static bool has_tree_cache(const std::string& root) {
     fs::path fastcp = fs::path(root) / ".fastcp";
-    std::string cache_path;
-
     std::error_code ec;
     if (fs::exists(fastcp, ec)) {
         for (auto& de : fs::directory_iterator(fastcp, ec)) {
             std::string name = de.path().filename().string();
-            if (name.rfind("treecache_", 0) == 0) {
-                cache_path = de.path().string();
-                break;
-            }
+            if (name.rfind("treecache_", 0) == 0) return true;
         }
     }
     // Legacy fallback: old installs used dst/.fastcp_treecache
-    if (cache_path.empty()) {
-        std::string legacy = (fs::path(root) / ".fastcp_treecache").string();
-        if (fs::exists(legacy, ec)) cache_path = legacy;
-    }
-    if (cache_path.empty()) return false;
-
-    std::ifstream f(cache_path, std::ios::binary);
-    if (!f) return false;
-
-    // Tree cache layout:
-    //   [16] tree_token  [4-LE] entry_count
-    //   per entry: [4] file_id  [8] file_size  [8] mtime_ns  [16] xxh3_128
-    //              [2] path_len  [1] flags  [path_len] rel_path
-    u8  token[16]; f.read((char*)token, 16);
-    u32 cnt = 0;   f.read((char*)&cnt, 4);
-    if (!f || cnt == 0) return false;
-
-    // Read only the first entry
-    u32 file_id   = 0; f.read((char*)&file_id,   4);
-    u64 file_size = 0; f.read((char*)&file_size, 8);
-    u64 mtime_ns  = 0; f.read((char*)&mtime_ns,  8);
-    u8  hash[16]{};    f.read((char*)hash, 16);
-    u16 path_len  = 0; f.read((char*)&path_len,  2);
-    u8  flags     = 0; f.read((char*)&flags,      1);
-    if (!f || path_len == 0 || path_len > 4096) return false;
-
-    std::string rel_path(path_len, '\0');
-    f.read(&rel_path[0], path_len);
-    if (!f) return false;
-
-    try {
-        fs::path abs = file_io::proto_to_fspath(root, rel_path);
-        return fs::exists(abs);
-    } catch (...) {
-        return false;
-    }
+    return fs::exists(fs::path(root) / ".fastcp_treecache", ec);
 }
 
 // Check if there is any interrupted VA progress file under dst/.fastcp/
@@ -211,7 +164,7 @@ int ClientApp::run() {
     //   first file exists        → Pipeline Sync  (incremental update)
     //   otherwise (no cache /
     //     first file missing)    → VA full  (first sync or wrong dst)
-    bool use_pipeline_sync = !has_va_progress && first_synced_file_exists(dst_dir_);
+    bool use_pipeline_sync = !has_va_progress && has_tree_cache(dst_dir_);
 
     u16 caps = CAP_RESUME | CAP_BUNDLE | CAP_COMPRESS | CAP_DELTA |
                CAP_VIRTUAL_ARCHIVE | CAP_CHUNK_RESUME | CAP_TREE_CACHE | CAP_COMPRESSED_TREE;
