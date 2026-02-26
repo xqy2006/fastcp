@@ -18,6 +18,7 @@
 #include <deque>
 #include <chrono>
 #include <iostream>
+#include <unordered_set>
 #include <fstream>
 #include <filesystem>
 #include <random>
@@ -761,6 +762,7 @@ bool ClientSession::phase_transfer(const SyncPlanMap& plan) {
         for (int ci = 0; ci < num_conns; ++ci) {
             if (conn_files[ci].empty()) continue;
             bundle_threads.emplace_back([&, ci]() {
+                try {
                 auto& files = conn_files[ci];
                 std::vector<const FileEntry*> batch;
                 u64 batch_size = 0;
@@ -783,6 +785,10 @@ bool ClientSession::phase_transfer(const SyncPlanMap& plan) {
                     }
                 }
                 flush();
+                } catch (const std::exception& e) {
+                    LOG_WARN("bundle send conn " + std::to_string(ci) + ": " + e.what());
+                    any_failed.store(true);
+                }
             });
         }
 
@@ -996,6 +1002,24 @@ bool ClientSession::phase_transfer_archive(const SyncPlanMap& plan) {
     LOG_INFO("CHUNK_REQUEST: " + std::to_string(needed_chunks.size()) +
              " chunks requested");
 
+    // Credit skipped chunks to TUI (resume: client already has some chunks)
+    if (needed_chunks.size() < archive.chunks().size()) {
+        // Build set of needed chunk ids for O(1) lookup
+        std::unordered_set<u32> needed_set(needed_chunks.begin(), needed_chunks.end());
+        u64 skipped_bytes = 0;
+        for (const auto& vc : archive.chunks()) {
+            if (needed_set.count(vc.chunk_id)) continue;
+            skipped_bytes += vc.raw_size;
+            // Credit files whose last span ends in this skipped chunk
+            for (const auto& span : vc.spans) {
+                const VirtualFile& vf = archive.files()[span.file_idx];
+                if (span.file_offset + span.length == vf.file_size)
+                    tui_state_.files_done.fetch_add(1);
+            }
+        }
+        tui_state_.bytes_sent.fetch_add(skipped_bytes);
+    }
+
     // If no chunks needed, send ARCHIVE_DONE immediately on all connections
     if (needed_chunks.empty()) {
         int num_conns = pool_.size();
@@ -1015,12 +1039,19 @@ bool ClientSession::phase_transfer_archive(const SyncPlanMap& plan) {
     // 6. Parallel send (one thread per connection)
     FileSender sender(pool_, tui_state_, cfg_.use_compress, agreed_chunk_size_,
                       delta_checksums_, delta_block_sizes_);
+    if (cfg_.max_chunks > 0)
+        sender.set_max_chunks(cfg_.max_chunks);
     std::vector<std::thread> threads;
     std::atomic<bool> any_failed{false};
 
     for (int ci = 0; ci < num_conns; ++ci) {
         threads.emplace_back([&, ci]() {
-            if (!sender.send_archive_range(archive, conn_chunks[(size_t)ci], ci)) {
+            try {
+                if (!sender.send_archive_range(archive, conn_chunks[(size_t)ci], ci)) {
+                    any_failed.store(true);
+                }
+            } catch (const std::exception& e) {
+                LOG_WARN("archive send conn " + std::to_string(ci) + ": " + e.what());
                 any_failed.store(true);
             }
         });
@@ -1192,6 +1223,8 @@ bool ClientSession::phase_pipeline_sync() {
     } else {
         LOG_INFO("Pipeline: tree cache HIT, skipped " +
                  std::to_string(entries_.size()) + " entries");
+        // No data will be sent; reset bytes_total so TUI shows 0 B/0 B
+        tui_state_.bytes_total.store(0);
     }
 
     // ---- Step 2: Set up file dispatch ----
@@ -1368,6 +1401,19 @@ bool ClientSession::phase_pipeline_sync() {
     // Safety: ensure preread thread is joined even if batch_send_small
     // was never called (e.g. no small files were WANT_FILEd).
     if (preread_th.joinable()) preread_th.join();
+
+    // Align TUI totals to actual sent amounts so progress shows X/X at the end.
+    // files_total was set to all entries; files_done only counts sent files.
+    // bytes_total was set to all file sizes; bytes_sent may be less due to
+    // chunk-level resume skipping already-matching chunks.
+    {
+        u32 done  = tui_state_.files_done.load();
+        u32 total = tui_state_.files_total.load();
+        if (done < total)
+            tui_state_.files_done.fetch_add(total - done);
+        // Snap bytes_total to bytes_sent so denominator matches numerator
+        tui_state_.bytes_total.store(tui_state_.bytes_sent.load());
+    }
 
     LOG_INFO("Pipeline: all requested files dispatched");
     return true;

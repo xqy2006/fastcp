@@ -276,9 +276,9 @@ int ClientApp::run() {
             tui_state.files_total.store(session->files_total.load());
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
         }
-        // Final update
+        // Final update: snap bytes_total to bytes_received so TUI shows X/X
         tui_state.bytes_sent.store(session->bytes_received.load());
-        tui_state.bytes_total.store(session->bytes_total.load());
+        tui_state.bytes_total.store(session->bytes_received.load());
         tui_state.files_done.store(session->files_done.load());
         tui_state.files_total.store(session->files_total.load());
     });
@@ -319,16 +319,23 @@ int ClientApp::run() {
     tui->stop();
 
     u64 total_received = session->bytes_received.load();
+    u64 bytes_skipped  = session->bytes_skipped.load();
+    u64 net_received   = total_received - bytes_skipped;
     u32 files_done     = session->files_done.load();
+    u32 files_skipped  = session->files_skipped.load();
     u32 files_total    = session->files_total.load();
+    u32 net_files      = files_done - files_skipped;
 
-    if (total_received == 0 && files_total > 0) {
+    if (net_received == 0 && files_total > 0) {
         std::cout << "All " << files_total
                   << " files already up to date, nothing to transfer.\n";
     } else {
         std::cout << "Transfer complete: "
-                  << utils::format_bytes(total_received)
-                  << " in " << files_done << " files\n";
+                  << utils::format_bytes(net_received)
+                  << " in " << net_files << " files";
+        if (files_skipped > 0)
+            std::cout << " (" << files_skipped << " skipped, already up to date)";
+        std::cout << "\n";
     }
 
     return session->done.load() ? 0 : 1;

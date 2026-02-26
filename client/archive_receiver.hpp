@@ -39,6 +39,7 @@ struct ArchiveFileSlot {
 class ArchiveReceiver {
 public:
     explicit ArchiveReceiver(std::shared_ptr<SessionInfo> session);
+    ~ArchiveReceiver();  // saves progress on destruction (handles interrupt)
 
     // Initialise from manifest data.
     // Call after all ARCHIVE_FILE_ENTRY messages have been decoded.
@@ -93,7 +94,6 @@ private:
     std::vector<u8> needed_bits_;            // bit i = 1 → chunk i still needed
     std::mutex      progress_mutex_;
     int             chunks_remaining_{0};    // count of set bits in needed_bits_
-    int             save_counter_{0};        // batch save every 100 chunks
 
     // Mark chunk as received; flush progress file every 100 calls; delete
     // the progress file automatically when all chunks are done.

@@ -26,6 +26,12 @@ ArchiveReceiver::ArchiveReceiver(std::shared_ptr<SessionInfo> session)
     : session_(std::move(session))
 {}
 
+ArchiveReceiver::~ArchiveReceiver() {
+    // Save progress on destruction so interrupts don't lose received chunks
+    std::lock_guard<std::mutex> lk(progress_mutex_);
+    save_progress_locked();
+}
+
 void ArchiveReceiver::init(std::vector<ArchiveFileSlot> slots,
                             u32 chunk_size,
                             u64 total_size)
@@ -166,27 +172,64 @@ void ArchiveReceiver::set_progress(const std::string& path, const u8 token[16]) 
 
     // Try to load an existing progress file
     std::ifstream f(path, std::ios::binary);
-    if (!f) return;
+    if (!f) { LOG_INFO("VA resume: no progress file at " + path); return; }
 
     u8 saved_token[16]{};
     f.read((char*)saved_token, 16);
-    if (!f || std::memcmp(saved_token, token, 16) != 0) return; // token mismatch
+    if (!f || std::memcmp(saved_token, token, 16) != 0) {
+        LOG_INFO("VA resume: token mismatch, ignoring progress file");
+        return;
+    }
 
     u32 saved_total = 0;
     f.read((char*)&saved_total, 4);
-    if (!f || saved_total != total_chunks_) return; // chunk count changed
+    if (!f || saved_total != total_chunks_) {
+        LOG_INFO("VA resume: chunk count mismatch (saved=" + std::to_string(saved_total) +
+                 " current=" + std::to_string(total_chunks_) + "), ignoring");
+        return;
+    }
 
     std::vector<u8> saved_bits(bytes);
     f.read((char*)saved_bits.data(), (std::streamsize)bytes);
-    if ((size_t)f.gcount() != bytes) return; // truncated file
+    if ((size_t)f.gcount() != bytes) { LOG_INFO("VA resume: truncated progress file"); return; }
 
     // Count remaining needed chunks from saved state
     needed_bits_ = saved_bits;
     chunks_remaining_ = 0;
+    u32 already_done = 0;
     for (u32 i = 0; i < total_chunks_; ++i) {
         if (needed_bits_[i / 8] & (u8)(1u << (i % 8)))
             ++chunks_remaining_;
+        else
+            ++already_done;
     }
+    // Seed bytes_received with already-completed bytes so TUI shows correct progress
+    u64 done_bytes = (u64)already_done * chunk_size_;
+    // Last chunk may be smaller; cap at total_size_
+    if (done_bytes > total_size_) done_bytes = total_size_;
+    session_->bytes_received.fetch_add(done_bytes);
+
+    // Seed files_done: count files whose every chunk is already received
+    for (size_t si = 0; si < slots_.size(); ++si) {
+        const auto& slot = slots_[si];
+        if (slot.file_size == 0) { session_->files_done.fetch_add(1); continue; }
+        u32 first_chunk = (u32)(slot.virtual_offset / chunk_size_);
+        u32 last_chunk  = (u32)((slot.virtual_offset + slot.file_size - 1) / chunk_size_);
+        u32 done_count = 0;
+        bool all_done = true;
+        for (u32 ci = first_chunk; ci <= last_chunk && ci < total_chunks_; ++ci) {
+            if (needed_bits_[ci / 8] & (u8)(1u << (ci % 8))) {
+                all_done = false;
+            } else {
+                ++done_count;
+            }
+        }
+        // Seed chunks_written_ so completion check works correctly on resume
+        if (done_count > 0)
+            chunks_written_[si].store(done_count);
+        if (all_done) session_->files_done.fetch_add(1);
+    }
+
     LOG_INFO("VA resume: progress loaded — " +
              std::to_string(total_chunks_ - chunks_remaining_) + "/" +
              std::to_string(total_chunks_) + " chunks already received");
@@ -209,11 +252,7 @@ void ArchiveReceiver::mark_chunk_done(u32 chunk_id) {
         progress_path_.clear();
         return;
     }
-    if (++save_counter_ >= 100) {
-        save_counter_ = 0;
-        save_progress_locked();
-    }
-}
+    save_progress_locked();}
 
 void ArchiveReceiver::save_progress_locked() {
     // Called while holding progress_mutex_

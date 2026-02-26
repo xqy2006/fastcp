@@ -624,6 +624,17 @@ bool FileSender::send_archive_range(const ArchiveBuilder& archive,
             LOG_WARN("send_archive_range: invalid chunk_id " + std::to_string(chunk_id));
             continue;
         }
+
+        // Test-only chunk limit: abort to simulate a crash
+        if (max_chunks_ > 0) {
+            int n = chunks_sent_.fetch_add(1) + 1;
+            if (n > max_chunks_) {
+                throw std::runtime_error(
+                    "CHUNK_LIMIT_REACHED (test mode, limit=" +
+                    std::to_string(max_chunks_) + ")");
+            }
+        }
+
         const VirtualChunk& vc = archive.chunks()[chunk_id];
 
         // Read raw chunk data (may span multiple files)

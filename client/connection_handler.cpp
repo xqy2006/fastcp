@@ -952,6 +952,7 @@ bool ConnectionHandler::handle_pipeline_file_tree() {
 
         // ---- Step 3: send WANT_FILE for files that need transfer ----
         TcpWriteBuffer wbuf(sock_);
+        u64 want_bytes = 0;
         for (size_t i = 0; i < session_->file_list.size(); ++i) {
             const auto& cfe = session_->file_list[i];
             const auto& li  = local_info[i];
@@ -959,8 +960,12 @@ bool ConnectionHandler::handle_pipeline_file_tree() {
                 WantFileMsg wmsg{}; wmsg.file_id = cfe.file_id; wmsg.reason = 0;
                 WantFileMsg enc = wmsg; proto::encode_want_file_msg(enc);
                 wbuf.write_frame(MsgType::MT_WANT_FILE, 0, &enc, sizeof(enc));
+                want_bytes += cfe.file_size;
             } else if (li.mtime_ns == cfe.mtime_ns) {
                 session_->files_done.fetch_add(1);
+                session_->files_skipped.fetch_add(1);
+                session_->bytes_skipped.fetch_add(cfe.file_size);
+                session_->bytes_received.fetch_add(cfe.file_size);
             } else {
                 bool has_server_hash = false;
                 for (int b = 0; b < 16; ++b)
@@ -979,14 +984,21 @@ bool ConnectionHandler::handle_pipeline_file_tree() {
                 }
                 if (content_ok) {
                     session_->files_done.fetch_add(1);
+                    session_->files_skipped.fetch_add(1);
+                    session_->bytes_skipped.fetch_add(cfe.file_size);
+                    session_->bytes_received.fetch_add(cfe.file_size);
                 } else {
                     WantFileMsg wmsg{}; wmsg.file_id = cfe.file_id;
                     wmsg.reason = has_server_hash ? u8(2) : u8(1);
                     WantFileMsg enc = wmsg; proto::encode_want_file_msg(enc);
                     wbuf.write_frame(MsgType::MT_WANT_FILE, 0, &enc, sizeof(enc));
+                    want_bytes += cfe.file_size;
                 }
             }
         }
+        // Set bytes_total = skipped bytes (already in bytes_received) + WANT bytes.
+        // This makes the TUI denominator match actual transfer size, not full dir size.
+        session_->bytes_total.store(session_->bytes_received.load() + want_bytes);
         wbuf.write_frame(MsgType::MT_FILE_CHECK_DONE, 0, nullptr, 0);
         wbuf.flush();
         LOG_INFO("Pipeline: FILE_CHECK_DONE sent");
@@ -1041,6 +1053,7 @@ bool ConnectionHandler::handle_pipeline_file_tree() {
     // instead of one write() syscall per file.  For 10 000 files this reduces
     // ~10 000 write() calls (~300 ms overhead) to ~10 calls.
     TcpWriteBuffer wbuf(sock_);
+    u64 want_bytes = 0;
 
     for (size_t i = 0; i < session_->file_list.size(); ++i) {
         const auto& cfe = session_->file_list[i];
@@ -1053,8 +1066,12 @@ bool ConnectionHandler::handle_pipeline_file_tree() {
             WantFileMsg enc = wmsg;
             proto::encode_want_file_msg(enc);
             wbuf.write_frame(MsgType::MT_WANT_FILE, 0, &enc, sizeof(enc));
+            want_bytes += cfe.file_size;
         } else if (li.mtime_ns == cfe.mtime_ns) {
             session_->files_done.fetch_add(1);
+            session_->files_skipped.fetch_add(1);
+            session_->bytes_skipped.fetch_add(cfe.file_size);
+            session_->bytes_received.fetch_add(cfe.file_size);
         } else {
             bool has_server_hash = false;
             for (int b = 0; b < 16; ++b)
@@ -1073,6 +1090,9 @@ bool ConnectionHandler::handle_pipeline_file_tree() {
             }
             if (content_ok) {
                 session_->files_done.fetch_add(1);
+                session_->files_skipped.fetch_add(1);
+                session_->bytes_skipped.fetch_add(cfe.file_size);
+                session_->bytes_received.fetch_add(cfe.file_size);
             } else {
                 WantFileMsg wmsg{};
                 wmsg.file_id = cfe.file_id;
@@ -1080,9 +1100,13 @@ bool ConnectionHandler::handle_pipeline_file_tree() {
                 WantFileMsg enc = wmsg;
                 proto::encode_want_file_msg(enc);
                 wbuf.write_frame(MsgType::MT_WANT_FILE, 0, &enc, sizeof(enc));
+                want_bytes += cfe.file_size;
             }
         }
     }
+
+    // Set bytes_total = skipped bytes (already in bytes_received) + WANT bytes.
+    session_->bytes_total.store(session_->bytes_received.load() + want_bytes);
 
     // ---- Step 3: Notify server that all files have been checked ----
     wbuf.write_frame(MsgType::MT_FILE_CHECK_DONE, 0, nullptr, 0);

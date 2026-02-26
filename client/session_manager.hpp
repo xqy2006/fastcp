@@ -73,9 +73,11 @@ struct SessionInfo {
     u8   dir_id[16]{};
 
     // Stats
-    std::atomic<u64> bytes_received{0};
-    std::atomic<u64> bytes_total{0};   // set by VA manifest; Pipeline uses file_list
+    std::atomic<u64> bytes_received{0};  // actual bytes received over network
+    std::atomic<u64> bytes_skipped{0};   // bytes of files skipped (already up-to-date)
+    std::atomic<u64> bytes_total{0};     // set by VA manifest; Pipeline uses file_list
     std::atomic<u32> files_done{0};
+    std::atomic<u32> files_skipped{0};   // files skipped (already up-to-date)
     std::atomic<u32> files_total{0};
 
     std::chrono::steady_clock::time_point start_time;
