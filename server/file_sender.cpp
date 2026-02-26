@@ -683,6 +683,14 @@ bool FileSender::send_archive_range(const ArchiveBuilder& archive,
         }
 
         tui_state_.bytes_sent.fetch_add(vc.raw_size);
+
+        // Increment files_done for each file whose last byte is in this chunk
+        for (const auto& span : vc.spans) {
+            const VirtualFile& vf = archive.files()[span.file_idx];
+            if (span.file_offset + span.length == vf.file_size) {
+                tui_state_.files_done.fetch_add(1);
+            }
+        }
     }
 
     // Signal end of this connection's archive range

@@ -1029,9 +1029,6 @@ bool ClientSession::phase_transfer_archive(const SyncPlanMap& plan) {
         if (t.joinable()) t.join();
     }
 
-    // Update TUI: count files sent
-    tui_state_.files_done.fetch_add((u32)archive.files().size());
-
     return !any_failed.load();
 }
 

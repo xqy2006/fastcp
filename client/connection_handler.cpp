@@ -807,6 +807,11 @@ bool ConnectionHandler::handle_pipeline_file_tree() {
 
             session_->file_list = std::move(cached_list);
             session_->files_total.store((u32)session_->file_list.size());
+            {
+                u64 bt = 0;
+                for (auto& f : session_->file_list) bt += f.file_size;
+                session_->bytes_total.store(bt);
+            }
 
             {
                 std::lock_guard<std::mutex> lk(session_->file_list_mutex);
@@ -905,6 +910,11 @@ bool ConnectionHandler::handle_pipeline_file_tree() {
         }
 
         session_->files_total.store((u32)session_->file_list.size());
+        {
+            u64 bt = 0;
+            for (auto& f : session_->file_list) bt += f.file_size;
+            session_->bytes_total.store(bt);
+        }
 
         // Signal secondary connections that they may enter handle_transfer_loop()
         {
@@ -1152,6 +1162,11 @@ bool ConnectionHandler::on_archive_manifest_hdr(const std::vector<u8>& payload) 
     std::memcpy(session_->dir_id, pending_manifest_hdr_.dir_id, 16);
     pending_archive_slots_.clear();
     pending_archive_slots_.reserve(pending_manifest_hdr_.total_files);
+    // Set progress totals so TUI shows correct Files/Bytes from the start
+    if (conn_index_ == 0) {
+        session_->files_total.store(pending_manifest_hdr_.total_files);
+        session_->bytes_total.store(pending_manifest_hdr_.total_virtual_size);
+    }
     LOG_DEBUG("ARCHIVE_MANIFEST_HDR: files=" +
               std::to_string(pending_manifest_hdr_.total_files) +
               " chunks=" + std::to_string(pending_manifest_hdr_.total_chunks));

@@ -74,6 +74,7 @@ struct SessionInfo {
 
     // Stats
     std::atomic<u64> bytes_received{0};
+    std::atomic<u64> bytes_total{0};   // set by VA manifest; Pipeline uses file_list
     std::atomic<u32> files_done{0};
     std::atomic<u32> files_total{0};
 

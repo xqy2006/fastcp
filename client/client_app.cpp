@@ -267,30 +267,20 @@ int ClientApp::run() {
     auto tui = std::make_unique<Tui>(tui_state);
 
     // Bridge thread: periodically copies session stats -> TUI state.
-    // Waits for file list to be ready before computing bytes_total.
     std::atomic<bool> bridge_stop{false};
     std::thread bridge([&]() {
-        // Wait until conn[0] has received the full file list
-        {
-            std::unique_lock<std::mutex> lk(session->file_list_mutex);
-            session->file_list_cv.wait_for(lk, std::chrono::seconds(60),
-                [&] { return session->file_list_ready; });
-        }
-
-        // Compute total bytes from file list
-        u64 bytes_total = 0;
-        for (auto& f : session->file_list) bytes_total += f.file_size;
-        tui_state.bytes_total.store(bytes_total);
-        tui_state.files_total.store(session->files_total.load());
-
         while (!bridge_stop.load()) {
             tui_state.bytes_sent.store(session->bytes_received.load());
+            tui_state.bytes_total.store(session->bytes_total.load());
             tui_state.files_done.store(session->files_done.load());
+            tui_state.files_total.store(session->files_total.load());
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
         }
         // Final update
         tui_state.bytes_sent.store(session->bytes_received.load());
+        tui_state.bytes_total.store(session->bytes_total.load());
         tui_state.files_done.store(session->files_done.load());
+        tui_state.files_total.store(session->files_total.load());
     });
 
     tui->start();
