@@ -94,13 +94,13 @@ void Tui::render() {
     u32 files_done  = state_.files_done.load();
     u32 files_total = state_.files_total.load();
 
-    // Compute speed (EWMA)
+    // Compute speed (EWMA, heavy smoothing to suppress 1MB chunk jumps)
     if (elapsed_s >= 0.05) {
         double instant_speed = (double)(bytes_sent - last_bytes_) / elapsed_s;
-        if (last_bytes_ == 0) {
+        if (last_bytes_ == 0 || smooth_speed_ == 0.0) {
             smooth_speed_ = instant_speed;
         } else {
-            smooth_speed_ = 0.7 * smooth_speed_ + 0.3 * instant_speed;
+            smooth_speed_ = 0.9 * smooth_speed_ + 0.1 * instant_speed;
         }
         last_bytes_ = bytes_sent;
         last_time_  = now;
