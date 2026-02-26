@@ -909,6 +909,12 @@ bool ClientSession::phase_transfer_archive(const SyncPlanMap& plan) {
     }
 
     // 2. Build virtual archive layout
+    std::sort(to_send.begin(), to_send.end(),
+              [](const FileEntry& a, const FileEntry& b) {
+                  return a.rel_path < b.rel_path;
+              });
+
+    // Build virtual archive layout
     ArchiveBuilder archive;
     archive.build(to_send, agreed_chunk_size_);
 
