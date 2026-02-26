@@ -272,6 +272,20 @@ void TcpSocket::close() {
     }
 }
 
+void TcpSocket::close_reset() {
+    if (fd_ != INVALID_SOCKET_VAL) {
+        // SO_LINGER with l_linger=0: close() sends RST instead of FIN,
+        // discarding any unsent data in the kernel send buffer immediately.
+        struct linger lg{};
+        lg.l_onoff  = 1;
+        lg.l_linger = 0;
+        setsockopt(fd_, SOL_SOCKET, SO_LINGER,
+                   reinterpret_cast<const char*>(&lg), sizeof(lg));
+        CLOSE_SOCKET(fd_);
+        fd_ = INVALID_SOCKET_VAL;
+    }
+}
+
 std::string TcpSocket::peer_addr() const {
     sockaddr_in peer{};
 #ifdef _WIN32

@@ -85,6 +85,7 @@ public:
                   u32 agreed_chunk_size = DEFAULT_CHUNK_SIZE);
 
     int run(); // blocks until transfer completes or fails
+    ~ClientSession() { pool_.reset_all(); } // RST on any exit path
 
 private:
     ServerConfig           cfg_;

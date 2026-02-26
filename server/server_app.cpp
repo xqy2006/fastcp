@@ -514,6 +514,8 @@ int ClientSession::run() {
     }
 
     phase_done();
+    pool_.reset_all();  // RST all connections: discard kernel send buffer so
+                        // client cannot consume stale data after reconnect
     tui_->stop();
 
     u64 bytes = tui_state_.bytes_sent.load();

@@ -418,6 +418,27 @@ void ArchiveReceiver::scatter_write(u64 archive_offset,
             LOG_DEBUG("archive_receiver: file complete: " + slot.abs_path);
             return slot.file_id;
         }
+
+        // Hash mismatch: delete the corrupted file and re-mark all its chunks
+        // as needed so the next resume will re-request and re-receive them.
+        {
+            std::error_code ec;
+            fs::remove(fs::path(slot.abs_path), ec);
+        }
+        chunks_written_[wi.si].store(0);
+        if (!progress_path_.empty() && slot.file_size > 0) {
+            u32 first_chunk = (u32)(slot.virtual_offset / chunk_size_);
+            u32 last_chunk  = (u32)((slot.virtual_offset + slot.file_size - 1) / chunk_size_);
+            std::lock_guard<std::mutex> lk(progress_mutex_);
+            for (u32 ci = first_chunk; ci <= last_chunk && ci < total_chunks_; ++ci) {
+                u8 bit = (u8)(1u << (ci % 8));
+                if (!(needed_bits_[ci / 8] & bit)) {
+                    needed_bits_[ci / 8] |= bit;
+                    ++chunks_remaining_;
+                }
+            }
+            save_progress_locked();
+        }
         return 0;
     };
 

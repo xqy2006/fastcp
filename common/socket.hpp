@@ -55,6 +55,11 @@ public:
 
     void close();
 
+    // Close with RST (SO_LINGER l_linger=0): discards send buffer immediately.
+    // Use on server side after session ends to prevent client from consuming
+    // stale buffered data from a previous interrupted transfer.
+    void close_reset();
+
     // Get peer address as string
     std::string peer_addr() const;
 

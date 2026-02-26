@@ -69,6 +69,15 @@ public:
     // Convenience: get a RAII guard
     Guard guard(int index) { return Guard(*this, index); }
 
+    // Close all connections with RST (discards kernel send buffer).
+    // Call on server side after session ends to prevent client from consuming
+    // stale buffered data after a reconnect.
+    void reset_all() {
+        for (auto& s : sockets_) {
+            if (s) s->close_reset();
+        }
+    }
+
     ConnectionPool(const ConnectionPool&) = delete;
     ConnectionPool& operator=(const ConnectionPool&) = delete;
 
